@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MemPipe WASM Demo — Basic Features &amp; GPT-2 Inference</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --orange: #d29922; --red: #f85149;
+    --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.6;
+    padding: 0 20px 60px;
+  }
+  header {
+    text-align: center; padding: 40px 0 20px;
+    border-bottom: 1px solid var(--border); margin-bottom: 30px;
+  }
+  header h1 { font-size: 2rem; font-weight: 700; }
+  header h1 span { color: var(--accent); }
+  header p { color: var(--text-dim); margin-top: 6px; }
+  .status-bar {
+    display: flex; gap: 16px; justify-content: center;
+    margin-top: 12px; flex-wrap: wrap;
+  }
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: 20px; font-size: 0.8rem;
+    background: var(--surface); border: 1px solid var(--border);
+    font-family: var(--font-mono);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .dot-loading { background: var(--orange); animation: pulse 1s infinite; }
+  .dot-ok { background: var(--green); }
+  .dot-err { background: var(--red); }
+  .dot-warn { background: var(--orange); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--border);
+    border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite;
+    vertical-align:middle; margin-right:6px; }
+
+  .container { max-width: 1200px; margin: 0 auto; }
+
+  .demo-section {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px; margin-bottom: 28px;
+  }
+  .demo-section h2 {
+    font-size: 1.3rem; margin-bottom: 8px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .demo-section h2 .badge {
+    font-size: 0.7rem; padding: 3px 8px; border-radius: 8px;
+    background: var(--accent); color: var(--bg); font-weight: 600;
+  }
+  .demo-section p.desc { color: var(--text-dim); margin-bottom: 16px; font-size: 0.9rem; }
+
+  .log-box {
+    background: #0d1117; border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 16px; font-family: var(--font-mono); font-size: 0.82rem;
+    max-height: 400px; overflow-y: auto; white-space: pre-wrap;
+    color: var(--text-dim); line-height: 1.55;
+  }
+  .log-box .info { color: var(--accent); }
+  .log-box .ok { color: var(--green); }
+  .log-box .warn { color: var(--orange); }
+  .log-box .err { color: var(--red); }
+  .log-box .val { color: #d2a8ff; }
+  .log-box .timing { color: var(--orange); }
+
+  table.bench {
+    width: 100%; border-collapse: collapse; font-family: var(--font-mono);
+    font-size: 0.82rem; margin-top: 12px;
+  }
+  table.bench th {
+    text-align: left; padding: 8px 12px; border-bottom: 2px solid var(--border);
+    color: var(--accent); font-weight: 600;
+  }
+  table.bench td {
+    padding: 6px 12px; border-bottom: 1px solid var(--border);
+  }
+  table.bench tr:hover td { background: rgba(88,166,255,0.05); }
+  table.bench .num { text-align: right; color: #d2a8ff; font-variant-numeric: tabular-nums; }
+
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .btn {
+    padding: 8px 18px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--surface); color: var(--text); cursor: pointer;
+    font-size: 0.85rem; font-family: inherit; transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary {
+    background: var(--accent); color: var(--bg); border-color: var(--accent);
+    font-weight: 600;
+  }
+  .btn-primary:hover { background: #79c0ff; }
+
+  input[type="text"], input[type="number"], select {
+    padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--bg); color: var(--text); font-size: 0.85rem;
+    font-family: inherit;
+  }
+  input[type="text"] { flex: 1; min-width: 200px; }
+  label { color: var(--text-dim); font-size: 0.82rem; margin-right: 4px; }
+
+  .progress-bar {
+    width: 100%; height: 6px; background: var(--border); border-radius: 3px;
+    margin: 8px 0; overflow: hidden;
+  }
+  .progress-bar .fill {
+    height: 100%; background: var(--accent); border-radius: 3px;
+    transition: width 0.3s ease;
+  }
+
+  .flex-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .metric-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px; margin: 12px 0;
+  }
+  .metric-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .metric-card .label { font-size: 0.72rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .metric-card .value { font-size: 1.3rem; font-weight: 700; font-family: var(--font-mono); color: var(--accent); margin-top: 2px; }
+  .metric-card .unit { font-size: 0.75rem; color: var(--text-dim); }
+
+  .token-output {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; font-family: var(--font-mono); font-size: 0.9rem;
+    min-height: 60px; white-space: pre-wrap; word-wrap: break-word;
+  }
+  .token-output .prompt-text { color: var(--text-dim); }
+  .token-output .gen-text { color: var(--green); }
+
+  footer {
+    text-align: center; padding: 30px 0; color: var(--text-dim);
+    font-size: 0.8rem; border-top: 1px solid var(--border); margin-top: 20px;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>MemPipe</span> WASM Demo</h1>
+  <p>Zero-allocation inference engine running in your browser via WebAssembly</p>
+  <div class="status-bar">
+    <span class="status-pill"><span class="dot dot-loading" id="dot-wasm"></span> <span id="status-wasm">Loading WASM…</span></span>
+    <span class="status-pill"><span class="dot dot-loading" id="dot-webgpu"></span> <span id="status-webgpu">Checking WebGPU…</span></span>
+    <span class="status-pill" id="pill-version" style="display:none"><span class="dot dot-ok"></span> <span id="status-version"></span></span>
+  </div>
+</header>
+
+<div class="container">
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- DEMO 1 — Basic MemPipe Features                                      -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+
+<div class="demo-section" id="demo1">
+  <h2><span class="badge">DEMO 1</span> Basic MemPipe WASM Features</h2>
+  <p class="desc">
+    Arena allocation, tensor operations, zero-copy memory, and operator benchmarks —
+    all running with zero heap allocations on the hot path.
+  </p>
+
+  <div class="controls">
+    <button class="btn btn-primary" id="btn-demo1" disabled onclick="runDemo1()">▶ Run Demo 1</button>
+  </div>
+
+  <!-- Build Info -->
+  <div class="metric-grid" id="demo1-info" style="display:none"></div>
+
+  <!-- Arena test results -->
+  <div id="demo1-arena" style="display:none; margin-top: 16px">
+    <h3 style="font-size:0.95rem; margin-bottom:8px; color:var(--accent)">Arena Allocation</h3>
+    <div class="log-box" id="demo1-arena-log"></div>
+  </div>
+
+  <!-- Zero-copy test -->
+  <div id="demo1-zerocopy" style="display:none; margin-top: 16px">
+    <h3 style="font-size:0.95rem; margin-bottom:8px; color:var(--accent)">Zero-Copy Memory</h3>
+    <div class="log-box" id="demo1-zerocopy-log"></div>
+  </div>
+
+  <!-- Operator Benchmarks -->
+  <div id="demo1-bench" style="display:none; margin-top: 16px">
+    <h3 style="font-size:0.95rem; margin-bottom:8px; color:var(--accent)">Operator Benchmarks (0 allocs/op guaranteed)</h3>
+    <table class="bench" id="demo1-bench-table">
+      <thead><tr>
+        <th>Operator</th><th>Iterations</th><th>Total (ms)</th>
+        <th>Avg (µs)</th><th>Throughput</th><th>Allocs/op</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+<!-- DEMO 2 — GPT-2 Inference with Hardware-Accelerated MatMul            -->
+<!-- ═══════════════════════════════════════════════════════════════════════ -->
+
+<div class="demo-section" id="demo2">
+  <h2><span class="badge">DEMO 2</span> GPT-2 Inference — Hardware-Accelerated MatMul</h2>
+  <p class="desc">
+    Load a converted GPT-2 <code>.mpmodel</code>, run autoregressive text generation
+    with the platform-optimized MatMul kernel (WebGPU on supported browsers, tiled WASM fallback otherwise).
+  </p>
+
+  <!-- Model loading -->
+  <div class="controls">
+    <button class="btn" id="btn-load-gpt2" disabled onclick="loadGPT2Model()">📂 Load gpt2.mpmodel</button>
+    <input type="file" id="file-gpt2" accept=".mpmodel" style="display:none" onchange="handleGPT2File(event)">
+    <span style="color:var(--text-dim); font-size:0.82rem;" id="load-hint">
+      Or the file will be auto-fetched from the server root.
+    </span>
+  </div>
+
+  <!-- Model info -->
+  <div id="demo2-model-info" style="display:none">
+    <div class="metric-grid" id="demo2-metrics"></div>
+  </div>
+
+  <!-- MatMul benchmark -->
+  <div id="demo2-matmul-bench" style="display:none; margin-top:16px">
+    <h3 style="font-size:0.95rem; margin-bottom:8px; color:var(--accent)">MatMul Benchmark (WASM — Hardware-Accelerated Path)</h3>
+    <button class="btn" id="btn-bench-matmul" onclick="runMatMulBench()">⚡ Run MatMul Benchmark</button>
+    <table class="bench" id="demo2-bench-table" style="display:none; margin-top:8px">
+      <thead><tr>
+        <th>Size (M×K×N)</th><th>Iterations</th><th>Total (ms)</th>
+        <th>Avg (ms)</th><th>GFLOPS</th><th>Allocs/op</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- Generation controls -->
+  <div id="demo2-generate" style="display:none; margin-top:16px">
+    <h3 style="font-size:0.95rem; margin-bottom:8px; color:var(--accent)">Token Generation</h3>
+    <div class="controls">
+      <label for="gpt2-tokens">Token IDs:</label>
+      <input type="text" id="gpt2-tokens" value="464,2068,7586" placeholder="Comma-separated token IDs">
+      <label for="gpt2-max">Max:</label>
+      <input type="number" id="gpt2-max" value="16" min="1" max="128" style="width:60px">
+      <label for="gpt2-temp">Temp:</label>
+      <input type="number" id="gpt2-temp" value="0.8" min="0" max="2" step="0.1" style="width:60px">
+      <button class="btn btn-primary" id="btn-generate" onclick="runGeneration()">▶ Generate</button>
+    </div>
+
+    <div class="progress-bar" id="gen-progress" style="display:none">
+      <div class="fill" id="gen-progress-fill" style="width:0%"></div>
+    </div>
+
+    <!-- Output -->
+    <div id="gen-output" style="display:none; margin-top:12px">
+      <div class="token-output" id="gen-text"></div>
+      <div class="metric-grid" id="gen-metrics" style="margin-top:12px"></div>
+    </div>
+
+    <!-- Per-step timings -->
+    <div id="gen-timings" style="display:none; margin-top:16px">
+      <h3 style="font-size:0.95rem; margin-bottom:8px; color:var(--accent)">Per-Step Timing</h3>
+      <table class="bench" id="gen-timings-table">
+        <thead><tr>
+          <th>Step</th><th>Token ID</th><th>Time (ms)</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Console -->
+<div class="demo-section">
+  <h2>Console Output</h2>
+  <div class="log-box" id="console-log" style="min-height: 80px"></div>
+</div>
+
+</div>
+
+<footer>
+  MemPipe — Zero-allocation inference engine &middot; Built with Go + WebAssembly
+</footer>
+
+<script>
+// ────────────────────────────────────────────────────────────────────────
+// Utility
+// ────────────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const logEl = $('console-log');
+
+function log(msg, cls = '') {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = msg + '\n';
+  logEl.appendChild(span);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function metricCard(label, value, unit = '') {
+  return `<div class="metric-card">
+    <div class="label">${label}</div>
+    <div class="value">${value} <span class="unit">${unit}</span></div>
+  </div>`;
+}
+
+function fmtNum(n, decimals = 2) {
+  if (typeof n !== 'number' || isNaN(n)) return '—';
+  return n.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Web Worker + async RPC
+// ────────────────────────────────────────────────────────────────────────
+let wasmReady = false;
+let hasWebGPU = false;
+let worker = null;
+let nextMsgId = 1;
+const pendingCalls = new Map();
+let onGenProgress = null; // callback for per-token progress
+
+function initWorker() {
+  return new Promise((resolve, reject) => {
+    log('Initializing Go WASM runtime in Web Worker…', 'info');
+    worker = new Worker('worker.js');
+
+    worker.onmessage = function (e) {
+      const data = e.data;
+
+      // ── Init message from worker ──
+      if (data.type === 'init') {
+        if (data.ok) {
+          wasmReady = true;
+          const ms = data.loadTimeMs.toFixed(1);
+          log(`  WASM binary: ${(data.wasmBytes / 1024 / 1024).toFixed(2)} MB`, '');
+          log(`  WASM ready in ${ms} ms (Web Worker)`, 'ok');
+          $('dot-wasm').className = 'dot dot-ok';
+          $('status-wasm').textContent = `WASM OK (${ms} ms, Worker)`;
+          $('btn-demo1').disabled = false;
+          $('btn-load-gpt2').disabled = false;
+          resolve();
+        } else {
+          log(`WASM init failed: ${data.error}`, 'err');
+          $('dot-wasm').className = 'dot dot-err';
+          $('status-wasm').textContent = 'WASM Error';
+          reject(new Error(data.error));
+        }
+        return;
+      }
+
+      // ── Progress message (generation) ──
+      if (data.type === 'progress') {
+        if (onGenProgress) onGenProgress(data);
+        return;
+      }
+
+      // ── Result / Error for a pending call ──
+      const pending = pendingCalls.get(data.id);
+      if (!pending) return;
+      pendingCalls.delete(data.id);
+
+      if (data.type === 'error') {
+        pending.reject(new Error(data.error));
+      } else {
+        pending.resolve(data.result);
+      }
+    };
+
+    worker.onerror = function (err) {
+      log(`Worker error: ${err.message}`, 'err');
+    };
+  });
+}
+
+// Call a function in the worker. Returns a Promise.
+function callWorker(method, args = [], transfers = []) {
+  return new Promise((resolve, reject) => {
+    const id = nextMsgId++;
+    pendingCalls.set(id, { resolve, reject });
+    worker.postMessage({ id, method, args }, transfers);
+  });
+}
+
+async function checkWebGPU() {
+  try {
+    if (!('gpu' in navigator)) throw new Error('navigator.gpu not available');
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) throw new Error('No WebGPU adapter');
+    hasWebGPU = true;
+
+    // Get adapter info — try new API (adapter.info) then legacy (requestAdapterInfo)
+    let desc = 'unknown';
+    if (adapter.info) {
+      desc = adapter.info.architecture || adapter.info.description || adapter.info.device || 'unknown';
+    } else if (typeof adapter.requestAdapterInfo === 'function') {
+      const info = await adapter.requestAdapterInfo();
+      desc = info.architecture || info.description || info.device || 'unknown';
+    }
+
+    $('dot-webgpu').className = 'dot dot-ok';
+    $('status-webgpu').textContent = `WebGPU: ${desc}`;
+    log(`WebGPU available: ${desc}`, 'ok');
+  } catch (e) {
+    // Not an error — it's an optional capability. Show as informational warning.
+    $('dot-webgpu').className = 'dot dot-warn';
+    $('status-webgpu').textContent = 'WebGPU: unavailable (optimized WASM kernel)';
+    log(`WebGPU not available: ${e.message}. Using optimized tiled WASM MatMul kernel.`, 'warn');
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Demo 1 — Basic Features
+// ────────────────────────────────────────────────────────────────────────
+async function runDemo1() {
+  if (!wasmReady) return;
+  $('btn-demo1').disabled = true;
+  log('\n═══ DEMO 1: Basic MemPipe Features ═══', 'info');
+
+  try {
+    // 1. Build info
+    const info = await callWorker('info');
+    const infoGrid = $('demo1-info');
+    infoGrid.innerHTML =
+      metricCard('Version', info.version) +
+      metricCard('Platform', info.platform) +
+      metricCard('HTTP', info.hasHTTP ? '✓' : '✗') +
+      metricCard('Filesystem', info.hasFilesystem ? '✓' : '✗') +
+      metricCard('Concurrency', info.hasConcurrency ? '✓' : '✗') +
+      metricCard('WebGPU (browser)', hasWebGPU ? '✓' : '✗') +
+      metricCard('WebGPU (WASM)', info.isWebGPUReady ? '✓ active' : '✗ fallback');
+    infoGrid.style.display = '';
+
+    $('pill-version').style.display = '';
+    $('status-version').textContent = `v${info.version} / ${info.platform}`;
+    log(`  Platform: ${info.platform}, Version: ${info.version}`, 'ok');
+
+    // 2. Arena test
+    const arenaLog = $('demo1-arena-log');
+    arenaLog.innerHTML = '';
+    const arena = await callWorker('testArena', [1024 * 1024]);
+    arenaLog.innerHTML +=
+      `<span class="info">Arena allocated:</span> ${arena.arenaSizeBytes.toLocaleString()} bytes ` +
+      `<span class="timing">(${arena.allocTimeUs} µs)</span>\n`;
+
+    const tensors = arena.tensors;
+    for (let i = 0; i < tensors.length; i++) {
+      const t = tensors[i];
+      if (t.error && t.error !== null) {
+        arenaLog.innerHTML += `<span class="err">  Tensor ${t.shape}: ERROR — ${t.error}</span>\n`;
+      } else {
+        arenaLog.innerHTML +=
+          `  Tensor ${t.shape}: <span class="val">${t.bytes.toLocaleString()} B</span> ` +
+          `@ ptr=0x${t.ptr.toString(16)} <span class="timing">(${t.allocTimeUs} µs)</span>\n`;
+      }
+    }
+    arenaLog.innerHTML +=
+      `<span class="ok">Arena usage:</span> ${arena.usedBytes.toLocaleString()} / ${arena.totalBytes.toLocaleString()} bytes ` +
+      `(${(arena.usedBytes / arena.totalBytes * 100).toFixed(1)}%)\n`;
+    $('demo1-arena').style.display = '';
+    log('  Arena allocation test — done', 'ok');
+
+    // 3. Zero-copy test
+    const zcLog = $('demo1-zerocopy-log');
+    zcLog.innerHTML = '';
+    const zc = await callWorker('testZeroCopy');
+    zcLog.innerHTML =
+      `<span class="info">Tensor:</span> shape=${zc.shape}, dtype=${zc.dtype}, elements=${zc.numElements}\n` +
+      `<span class="info">WASM ptr:</span> 0x${zc.ptr.toString(16)} (${zc.byteSize} bytes)\n` +
+      `<span class="info">First 5 values:</span> <span class="val">${zc.first5}</span>\n` +
+      `<span class="ok">Zero-copy:</span> JS can create Float32Array(wasmMemory.buffer, 0x${zc.ptr.toString(16)}, ${zc.numElements}) for direct access.\n`;
+    $('demo1-zerocopy').style.display = '';
+    log('  Zero-copy memory test — done', 'ok');
+
+    // 4. Operator benchmarks
+    log('  Running operator benchmarks…', 'info');
+    const benchResults = await callWorker('benchOperators');
+    if (!benchResults || !Array.isArray(benchResults)) {
+      log('  Operator benchmarks returned no data (WASM runtime may have crashed)', 'warn');
+      throw new Error('benchOperators returned invalid result');
+    }
+    const tbody = $('demo1-bench-table').querySelector('tbody');
+    tbody.innerHTML = '';
+    for (let i = 0; i < benchResults.length; i++) {
+      const r = benchResults[i];
+      const throughput = r.flops > 1e9
+        ? fmtNum(r.flops / 1e9) + ' GFLOPS'
+        : fmtNum(r.flops / 1e6) + ' MFLOPS';
+      tbody.innerHTML += `<tr>
+        <td>${r.op}</td>
+        <td class="num">${r.iters}</td>
+        <td class="num">${fmtNum(r.totalMs)}</td>
+        <td class="num">${fmtNum(r.avgUs, 1)}</td>
+        <td class="num">${throughput}</td>
+        <td class="num" style="color:var(--green)">${r.allocsPerOp}</td>
+      </tr>`;
+    }
+    $('demo1-bench').style.display = '';
+    log('  Operator benchmarks — done', 'ok');
+  } catch (err) {
+    log(`  Demo 1 error: ${err.message}`, 'err');
+  }
+
+  $('btn-demo1').disabled = false;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Demo 2 — GPT-2 Inference
+// ────────────────────────────────────────────────────────────────────────
+async function loadGPT2Model() {
+  if (!wasmReady) return;
+
+  log('\n═══ DEMO 2: Loading GPT-2 Model ═══', 'info');
+  $('btn-load-gpt2').disabled = true;
+
+  try {
+    log('  Fetching gpt2.mpmodel from server…', 'info');
+    const t0 = performance.now();
+    const resp = await fetch('gpt2.mpmodel');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const bytes = new Uint8Array(await resp.arrayBuffer());
+    const fetchMs = (performance.now() - t0).toFixed(1);
+    log(`  Fetched ${(bytes.byteLength / 1024 / 1024).toFixed(2)} MB in ${fetchMs} ms`, 'ok');
+
+    await processGPT2Bytes(bytes);
+  } catch (e) {
+    log(`  Auto-fetch failed (${e.message}). You can select the file manually.`, 'warn');
+    $('btn-load-gpt2').disabled = false;
+  }
+}
+
+function handleGPT2File(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  log(`  Reading file: ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`, 'info');
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    processGPT2Bytes(new Uint8Array(reader.result));
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+async function processGPT2Bytes(bytes) {
+  log(`  Parsing model (${bytes.byteLength.toLocaleString()} bytes)…`, 'info');
+
+  // Transfer the ArrayBuffer to the worker (zero-copy)
+  const result = await callWorker('loadGPT2', [bytes], [bytes.buffer]);
+
+  if (result.error && result.error !== null) {
+    log(`  ERROR: ${result.error}`, 'err');
+    $('btn-load-gpt2').disabled = false;
+    return;
+  }
+
+  // Show model metrics
+  const m = $('demo2-metrics');
+  m.innerHTML =
+    metricCard('Model', result.modelName) +
+    metricCard('File Size', fmtNum(result.fileSize / 1024 / 1024), 'MB') +
+    metricCard('Parse Time', fmtNum(result.parseTimeMs), 'ms') +
+    metricCard('Engine Init', fmtNum(result.engineTimeMs), 'ms') +
+    metricCard('JS→WASM Copy', fmtNum(result.copyTimeMs), 'ms') +
+    metricCard('Weights', fmtNum(result.weightsMB), 'MB') +
+    metricCard('Graph Ops', result.graphOps) +
+    metricCard('Tensors', result.tensorCount) +
+    metricCard('Input Shape', result.inputShape) +
+    metricCard('Output Shape', result.outputShape) +
+    metricCard('Seq Length', result.seqLen) +
+    metricCard('Vocab Size', result.vocabSize) +
+    metricCard('Arena Used', fmtNum(result.arenaUsedMB), 'MB') +
+    metricCard('Arena Total', fmtNum(result.arenaTotalMB), 'MB') +
+    metricCard('MatMul Accel', result.webgpuActive ? 'WebGPU ✓' : 'Generic (no GPU)');
+  $('demo2-model-info').style.display = '';
+  $('demo2-matmul-bench').style.display = '';
+  $('demo2-generate').style.display = '';
+
+  log(`  Model loaded: ${result.modelName}`, 'ok');
+  log(`    Weights: ${fmtNum(result.weightsMB)} MB, Graph: ${result.graphOps} ops`, '');
+  log(`    Seq length: ${result.seqLen}, Vocab: ${result.vocabSize}`, '');
+  log(`    MatMul accelerator: ${result.webgpuActive ? 'WebGPU' : 'Generic WASM fallback'}`, result.webgpuActive ? 'ok' : 'warn');
+  log(`    Arena: ${fmtNum(result.arenaUsedMB)} / ${fmtNum(result.arenaTotalMB)} MB`, '');
+  log(`    Total load time: ${fmtNum(result.copyTimeMs + result.parseTimeMs + result.engineTimeMs)} ms`, 'timing');
+}
+
+// MatMul benchmark
+async function runMatMulBench() {
+  if (!wasmReady) return;
+  $('btn-bench-matmul').disabled = true;
+  log('\n  Running MatMul benchmarks (hardware-accelerated path)…', 'info');
+
+  try {
+    const results = await callWorker('benchMatMul');
+    const tbody = $('demo2-bench-table').querySelector('tbody');
+    tbody.innerHTML = '';
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.error) {
+        tbody.innerHTML += `<tr><td>${r.size}</td><td colspan="5" class="err">${r.error}</td></tr>`;
+        continue;
+      }
+      tbody.innerHTML += `<tr>
+        <td>${r.size}</td>
+        <td class="num">${r.iters}</td>
+        <td class="num">${fmtNum(r.totalMs)}</td>
+        <td class="num">${fmtNum(r.avgMs, 3)}</td>
+        <td class="num">${fmtNum(r.gflops, 3)}</td>
+        <td class="num" style="color:var(--green)">${r.allocsPerOp}</td>
+      </tr>`;
+      log(`    ${r.size}: ${fmtNum(r.avgMs, 3)} ms/op, ${fmtNum(r.gflops, 3)} GFLOPS`, '');
+    }
+    $('demo2-bench-table').style.display = '';
+    log('  MatMul benchmarks — done', 'ok');
+  } catch (err) {
+    log(`  MatMul bench error: ${err.message}`, 'err');
+  }
+
+  $('btn-bench-matmul').disabled = false;
+}
+
+// Token generation — per-token streaming via Web Worker
+async function runGeneration() {
+  if (!wasmReady) return;
+  $('btn-generate').disabled = true;
+
+  const tokStr = $('gpt2-tokens').value.trim();
+  const maxTokRaw = parseInt($('gpt2-max').value);
+  const maxTok = Number.isFinite(maxTokRaw) ? maxTokRaw : 16;
+  const tempRaw = parseFloat($('gpt2-temp').value);
+  const temp = Number.isFinite(tempRaw) ? tempRaw : 0.8;
+
+  const tokenIDs = tokStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+  if (tokenIDs.length === 0) {
+    log('  ERROR: No valid token IDs', 'err');
+    $('btn-generate').disabled = false;
+    return;
+  }
+
+  log(`\n  Generating ${maxTok} tokens (input: [${tokenIDs.join(',')}], temp=${temp})…`, 'info');
+
+  // Show animated progress
+  $('gen-progress').style.display = '';
+  $('gen-progress-fill').style.width = '0%';
+  $('gen-progress-fill').style.transition = 'width 0.3s ease';
+
+  // Prepare per-step timing table live
+  const ttbody = $('gen-timings-table').querySelector('tbody');
+  ttbody.innerHTML = '';
+  $('gen-timings').style.display = '';
+
+  // Set up per-token progress callback
+  const liveTokens = [];
+  onGenProgress = function (data) {
+    const pct = (data.step / data.total * 100).toFixed(0);
+    $('gen-progress-fill').style.width = pct + '%';
+    liveTokens.push(data.token);
+
+    // Add row to timings table
+    ttbody.innerHTML += `<tr>
+      <td class="num">${data.step}</td>
+      <td class="num">${data.token}</td>
+      <td class="num">${fmtNum(data.timeMs, 2)}</td>
+    </tr>`;
+
+    log(`    Step ${data.step}/${data.total}: token=${data.token} (${fmtNum(data.timeMs, 2)} ms)`, '');
+  };
+
+  try {
+    const t0 = performance.now();
+    const result = await callWorker('generateGPT2', [tokenIDs, maxTok, temp]);
+    const wallMs = performance.now() - t0;
+
+    onGenProgress = null;
+    $('gen-progress-fill').style.width = '100%';
+
+    if (result.error && result.error !== null) {
+      log(`  ERROR: ${result.error}`, 'err');
+      $('btn-generate').disabled = false;
+      return;
+    }
+
+    const genTokens = result.tokens;
+
+    // Best-effort byte decode
+    const promptDecoded = tokenIDs.map(t => t >= 0 && t < 256 ? String.fromCharCode(t) : `<${t}>`).join('');
+    const genDecoded = genTokens.map(t => t >= 0 && t < 256 ? String.fromCharCode(t) : `<${t}>`).join('');
+
+    const textEl = $('gen-text');
+    textEl.innerHTML = `<span class="prompt-text">${escapeHtml(promptDecoded)}</span><span class="gen-text">${escapeHtml(genDecoded)}</span>`;
+    $('gen-output').style.display = '';
+
+    // Metrics
+    const gm = $('gen-metrics');
+    gm.innerHTML =
+      metricCard('Total Time', fmtNum(result.totalMs), 'ms') +
+      metricCard('Wall Time (JS)', fmtNum(wallMs), 'ms') +
+      metricCard('Tokens/sec', fmtNum(result.tokensPerSec, 1)) +
+      metricCard('Input Tokens', result.inputTokens) +
+      metricCard('Generated', result.generatedCount) +
+      metricCard('Token IDs', genTokens.join(', '));
+
+    // Summary row for per-step table
+    let totalStepMs = 0;
+    for (const s of result.stepTimings) totalStepMs += s.timeMs;
+    ttbody.innerHTML += `<tr style="font-weight:bold; border-top:2px solid var(--border)">
+      <td>Total</td><td></td>
+      <td class="num">${fmtNum(totalStepMs, 2)}</td>
+    </tr>`;
+
+    log(`  Generated ${genTokens.length} tokens in ${fmtNum(result.totalMs)} ms (${fmtNum(result.tokensPerSec, 1)} tok/s)`, 'ok');
+    log(`  Token IDs: [${genTokens.join(', ')}]`, '');
+  } catch (err) {
+    log(`  Generation error: ${err.message}`, 'err');
+    onGenProgress = null;
+  }
+
+  $('btn-generate').disabled = false;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Boot
+// ────────────────────────────────────────────────────────────────────────
+(async () => {
+  checkWebGPU();
+  await initWorker().catch(() => {});
+})();
+</script>
+
+</body>
+</html>

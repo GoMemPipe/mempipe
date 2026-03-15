@@ -8,11 +8,7 @@ examples/custom_modules/mempipe-custom
 *.exe
 *.out
 build/gpt2-binary
-ai_inference
-audio_dsp
-game_server
-hft_pipeline
-wasm_demo
+
 
 # Plans (internal tracking)
 plans/
@@ -45,6 +41,7 @@ Thumbs.db
 __pycache__/
 *.mpmodel
 *.onnx
+*.wasm
 
 # Build output
 dist/
