@@ -1,0 +1,58 @@
+# Binaries
+/mempipe
+/mempipec
+/wasm
+mempipe_modules
+*/mempipe-custom/*
+examples/custom_modules/mempipe-custom
+*.exe
+*.out
+build/gpt2-binary
+ai_inference
+audio_dsp
+game_server
+hft_pipeline
+wasm_demo
+
+# Plans (internal tracking)
+plans/
+
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# Test coverage
+*.cover
+*.coverprofile
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+*.pyc
+__pycache__/
+*.mpmodel
+*.onnx
+
+# Build output
+dist/
+bin/
+
+# Python virtual environment
+.venv/
+
+# Implementation history
+PHASE_*.md
+

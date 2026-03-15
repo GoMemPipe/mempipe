@@ -1,0 +1,222 @@
+# MemPipe CI/CD Pipeline
+# ────────────────────────────────────────────────────────────────────────────
+# Runs on every push and pull request:
+#   - Tests (Go 1.21, 1.22, latest)
+#   - go vet
+#   - memlint static analysis (zero-alloc enforcement)
+#   - Benchmarks with allocation gating
+#   - WASM build with size gating
+#   - TinyGo build (embedded target)
+# ────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main, "release/*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  WASM_SIZE_LIMIT: 8388608  # 8 MB in bytes
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1: Test matrix across Go versions
+  # ──────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test (Go ${{ matrix.go-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ["1.22", "1.23", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Run tests
+        run: go test ./... -count=1 -timeout=60s
+
+      - name: Run tests with race detector
+        run: go test ./... -race -count=1 -timeout=120s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2: Static analysis (vet + memlint)
+  # ──────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Install memlint
+        working-directory: tools/memlint
+        run: go install ./cmd/memlint/
+
+      - name: Run memlint
+        run: go vet -vettool=$(which memlint) ./...
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 3: Benchmark gating — zero-alloc enforcement
+  # ──────────────────────────────────────────────────────────────────────────
+  bench-gate:
+    name: Benchmark Gating
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Run benchmarks
+        run: |
+          go test ./... -bench=. -benchmem -count=1 -timeout=120s \
+            | tee bench_raw.txt
+          # Extract only actual benchmark result lines (contain B/op)
+          grep 'B/op' bench_raw.txt > bench.txt || true
+
+      - name: Check zero-alloc benchmarks
+        run: |
+          # Every benchmark that previously had //mem:nogc must report 0 allocs/op.
+          # These are the arena/region/typed-region benchmarks.
+          # Fail if any benchmark in runtime/ or builder/ reports >0 allocs.
+          echo "==> Checking for allocation regressions..."
+
+          FAIL=0
+
+          # Check region benchmarks (must be 0 allocs/op)
+          # Exclude VecF32Read (convenience method, //mem:allow) and
+          # ArenaAlloc_100Tensors (inference bench that creates new arenas each iter).
+          if grep -E 'BenchmarkRegion|BenchmarkArena|BenchmarkTypedRegion' bench.txt \
+               | grep -v 'VecF32Read' \
+               | grep -v 'ArenaAlloc_100Tensors' \
+               | grep -v '0 B/op'; then
+            echo "ERROR: Region/Arena benchmarks must be zero-alloc!"
+            FAIL=1
+          fi
+
+          # Check builder context benchmarks (must be 0 allocs/op)
+          if grep -E 'BenchmarkBuilderContext|BenchmarkBuilderMultiField' bench.txt \
+               | grep -v '0 B/op'; then
+            echo "ERROR: Builder context benchmarks must be zero-alloc!"
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -eq 1 ]; then
+            echo ""
+            echo "FAILED: One or more zero-alloc benchmarks show heap allocations."
+            echo "Full benchmark output:"
+            cat bench.txt
+            exit 1
+          fi
+
+          echo "==> All zero-alloc benchmarks verified: 0 B/op"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            bench_raw.txt
+            bench.txt
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 4: WASM build with size gating
+  # ──────────────────────────────────────────────────────────────────────────
+  wasm:
+    name: WASM Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build WASM module
+        run: |
+          mkdir -p dist
+          GOOS=js GOARCH=wasm go build \
+            -ldflags="-s -w" \
+            -o dist/mempipe.wasm \
+            ./platform/wasm/
+
+      - name: WASM size gating
+        run: |
+          SIZE=$(stat -c%s dist/mempipe.wasm)
+          echo "WASM binary size: $SIZE bytes ($(numfmt --to=iec $SIZE))"
+          echo "Size limit: $WASM_SIZE_LIMIT bytes ($(numfmt --to=iec $WASM_SIZE_LIMIT))"
+
+          if [ "$SIZE" -gt "$WASM_SIZE_LIMIT" ]; then
+            echo "FAILED: WASM binary exceeds size limit!"
+            exit 1
+          fi
+
+          echo "PASSED: WASM size within limit."
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mempipe-wasm
+          path: dist/mempipe.wasm
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 5: TinyGo build (embedded target)
+  # ──────────────────────────────────────────────────────────────────────────
+  tinygo:
+    name: TinyGo WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install TinyGo
+        run: |
+          wget -q https://github.com/tinygo-org/tinygo/releases/download/v0.33.0/tinygo_0.33.0_amd64.deb
+          sudo dpkg -i tinygo_0.33.0_amd64.deb
+
+      - name: Build TinyGo WASM
+        run: |
+          mkdir -p dist
+          tinygo build \
+            -target=wasm \
+            -tags embedded \
+            -no-debug \
+            -o dist/mempipe-tiny.wasm \
+            ./platform/wasm/
+          echo "TinyGo WASM size:"
+          ls -lh dist/mempipe-tiny.wasm
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 6: Examples compile
+  # ──────────────────────────────────────────────────────────────────────────
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build all examples
+        run: go build ./examples/...
