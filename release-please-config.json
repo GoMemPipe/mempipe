@@ -1,0 +1,25 @@
+{
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "package-name": "mempipe",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "changelog-sections": [
+        { "type": "feat", "section": "Features" },
+        { "type": "fix", "section": "Bug Fixes" },
+        { "type": "perf", "section": "Performance" },
+        { "type": "docs", "section": "Documentation" },
+        { "type": "chore", "section": "Miscellaneous" }
+      ],
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "mempipe.go",
+          "glob": false
+        }
+      ]
+    }
+  },
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json"
+}
