@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.2](https://github.com/GoMemPipe/mempipe/compare/mempipe-v1.1.1...mempipe-v1.1.2) (2026-03-26)
+
+
+### Documentation
+
+* add funding configuration and support section to README ([8c3312e](https://github.com/GoMemPipe/mempipe/commit/8c3312e2a748618d4a31f67dd2d666674b8a910b))
+* add funding configuration and support section to README ([7310863](https://github.com/GoMemPipe/mempipe/commit/73108637e7f0a81a03d9d15f5da93aa0f9b41521))
+
 ## [1.1.1](https://github.com/GoMemPipe/mempipe/compare/mempipe-v1.1.0...mempipe-v1.1.1) (2026-03-26)
 
 
