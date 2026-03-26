@@ -11,4 +11,4 @@
 package mempipe
 
 // Version is the single source of truth for the mempipe library version.
-const Version = "1.0.0"
+const Version = "1.0.1"
