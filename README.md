@@ -303,7 +303,18 @@ Built-in modules register via `init()` and integrate with the scheduler lifecycl
 5. Ensure **0 allocs/op** on all `//mem:nogc` benchmarks
 6. Submit a pull request
 
+## Support the Project
+
+❤️ If MemPipe saved you in CPU credits, consider buying us a CPU core to keep the project alive.
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black&style=for-the-badge)](https://buymeacoffee.com/gomempipe)
+
+We also accept cryptocurrency donations:
+- **Bitcoin**: `bc1qy5yg97y6utrxm84erfhvyjg8e0saqg83ae6286`
+
+Your support helps us maintain and improve MemPipe for everyone.
+
 ## License
 
-[MIT](LICENSE) — Copyright GoMemPipe (Hashem Zargari)
+[MIT](LICENSE) — Copyright GoMemPipe
 

@@ -1,0 +1,8 @@
+# GitHub funding configuration for MemPipe
+
+# Buy Me a Coffee sponsor link
+buy_me_a_coffee: gomempipe
+
+# Custom funding links (Bitcoin address)
+custom:
+  - https://btc.donation.link/?address=bc1qy5yg97y6utrxm84erfhvyjg8e0saqg83ae6286
