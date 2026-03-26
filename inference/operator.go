@@ -196,7 +196,6 @@ func (addOp) Execute(inputs, outputs []*Tensor) error {
 	nb := len(bData)
 
 	if nb == na {
-		// Same size: element-wise
 		for i := 0; i < na; i++ {
 			cData[i] = aData[i] + bData[i]
 		}
@@ -210,13 +209,14 @@ func (addOp) Execute(inputs, outputs []*Tensor) error {
 		for i := 0; i < nb; i++ {
 			cData[i] = scalar + bData[i]
 		}
+	} else if len(a.shape) > 1 || len(b.shape) > 1 {
+		// N-dimensional broadcasting using shapes
+		broadcastBinOp(a.shape, b.shape, c.shape, aData, bData, cData, func(av, bv float32) float32 { return av + bv })
 	} else if nb < na && na%nb == 0 {
-		// Broadcasting: b is smaller
 		for i := 0; i < na; i++ {
 			cData[i] = aData[i] + bData[i%nb]
 		}
 	} else if na < nb && nb%na == 0 {
-		// Broadcasting: a is smaller — repeat a along trailing dims
 		for i := 0; i < nb; i++ {
 			cData[i] = aData[i%na] + bData[i]
 		}
@@ -330,6 +330,85 @@ func softmaxRow(src, dst []float32) {
 
 func (softmaxOp) OutputShape(in []Shape) ([]Shape, error) {
 	return inferOpOutputShapes(OpSoftmax, in, nil)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// broadcastBinOp performs N-dimensional broadcasting for binary element-wise
+// operations. It computes cData[i] = fn(aData[a_idx], bData[b_idx]) for every
+// output element, where a_idx and b_idx respect broadcast semantics:
+// dimensions of size 1 are repeated to match the output shape.
+//
+// Shapes are right-aligned (numpy-style broadcast rules).
+//
+//mem:hot
+func broadcastBinOp(
+	aShape, bShape, cShape []int,
+	aData, bData, cData []float32,
+	fn func(float32, float32) float32,
+) {
+	ndims := len(cShape)
+
+	// Compute strides for output, and broadcast strides for A and B.
+	// A broadcast stride is 0 when the dimension size is 1 (broadcast dim).
+	var cStrides, aStrides, bStrides [8]int
+
+	cStrides[ndims-1] = 1
+	for i := ndims - 2; i >= 0; i-- {
+		cStrides[i] = cStrides[i+1] * cShape[i+1]
+	}
+
+	// Right-align A shape to output shape
+	aOff := ndims - len(aShape)
+	aStrides[ndims-1] = 1
+	for i := ndims - 2; i >= 0; i-- {
+		ai := i - aOff
+		if ai >= 0 && ai+1 < len(aShape) {
+			aStrides[i] = aStrides[i+1] * aShape[ai+1]
+		} else {
+			aStrides[i] = aStrides[i+1]
+		}
+	}
+	// Zero out strides for broadcast dims in A
+	for i := 0; i < ndims; i++ {
+		ai := i - aOff
+		if ai < 0 || aShape[ai] == 1 {
+			aStrides[i] = 0
+		}
+	}
+
+	// Right-align B shape to output shape
+	bOff := ndims - len(bShape)
+	bStrides[ndims-1] = 1
+	for i := ndims - 2; i >= 0; i-- {
+		bi := i - bOff
+		if bi >= 0 && bi+1 < len(bShape) {
+			bStrides[i] = bStrides[i+1] * bShape[bi+1]
+		} else {
+			bStrides[i] = bStrides[i+1]
+		}
+	}
+	// Zero out strides for broadcast dims in B
+	for i := 0; i < ndims; i++ {
+		bi := i - bOff
+		if bi < 0 || bShape[bi] == 1 {
+			bStrides[i] = 0
+		}
+	}
+
+	total := len(cData)
+	for idx := 0; idx < total; idx++ {
+		// Decompose linear index into N-dim coordinates
+		remain := idx
+		aIdx := 0
+		bIdx := 0
+		for d := 0; d < ndims; d++ {
+			coord := remain / cStrides[d]
+			remain %= cStrides[d]
+			aIdx += coord * aStrides[d]
+			bIdx += coord * bStrides[d]
+		}
+		cData[idx] = fn(aData[aIdx], bData[bIdx])
+	}
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1008,24 +1087,23 @@ func (mulOp) Execute(inputs, outputs []*Tensor) error {
 			cData[i] = aData[i] * bData[i]
 		}
 	} else if nb == 1 {
-		// Scalar broadcast
 		scalar := bData[0]
 		for i := 0; i < na; i++ {
 			cData[i] = aData[i] * scalar
 		}
 	} else if na == 1 {
-		// Scalar broadcast (a is scalar)
 		scalar := aData[0]
 		for i := 0; i < nb; i++ {
 			cData[i] = scalar * bData[i]
 		}
+	} else if len(a.shape) > 1 || len(b.shape) > 1 {
+		// N-dimensional broadcasting using shapes
+		broadcastBinOp(a.shape, b.shape, c.shape, aData, bData, cData, func(av, bv float32) float32 { return av * bv })
 	} else if nb < na && na%nb == 0 {
-		// b is smaller: broadcast b over a
 		for i := 0; i < na; i++ {
 			cData[i] = aData[i] * bData[i%nb]
 		}
 	} else if na < nb && nb%na == 0 {
-		// Broadcasting: a is smaller — repeat a along trailing dims
 		for i := 0; i < nb; i++ {
 			cData[i] = aData[i%na] * bData[i]
 		}
@@ -1068,12 +1146,14 @@ func (subOp) Execute(inputs, outputs []*Tensor) error {
 		for i := 0; i < nb; i++ {
 			cData[i] = scalar - bData[i]
 		}
+	} else if len(a.shape) > 1 || len(b.shape) > 1 {
+		// N-dimensional broadcasting using shapes
+		broadcastBinOp(a.shape, b.shape, c.shape, aData, bData, cData, func(av, bv float32) float32 { return av - bv })
 	} else if nb < na && na%nb == 0 {
 		for i := 0; i < na; i++ {
 			cData[i] = aData[i] - bData[i%nb]
 		}
 	} else if na < nb && nb%na == 0 {
-		// Broadcasting: a is smaller — repeat a along trailing dims
 		for i := 0; i < nb; i++ {
 			cData[i] = aData[i%na] - bData[i]
 		}
@@ -1092,9 +1172,27 @@ func (subOp) OutputShape(in []Shape) ([]Shape, error) {
 // Attrs: [ndims u16, perm0 u16, perm1 u16, ...]
 // ════════════════════════════════════════════════════════════════════════════
 
-type transposeOp struct{}
+type transposeOp struct {
+	perm [8]int
+	ndim int // 0 means "not set from attrs"
+}
 
-func (transposeOp) Execute(inputs, outputs []*Tensor) error {
+func (op *transposeOp) SetAttrs(attrs []byte) error {
+	if len(attrs) < 2 {
+		return nil
+	}
+	ndims := int(binary.LittleEndian.Uint16(attrs[0:2]))
+	if ndims > 8 || len(attrs) < 2+ndims*2 {
+		return fmt.Errorf("transpose: invalid attrs (ndims=%d, len=%d)", ndims, len(attrs))
+	}
+	op.ndim = ndims
+	for i := 0; i < ndims; i++ {
+		op.perm[i] = int(binary.LittleEndian.Uint16(attrs[2+i*2 : 4+i*2]))
+	}
+	return nil
+}
+
+func (op *transposeOp) Execute(inputs, outputs []*Tensor) error {
 	src := inputs[0]
 	dst := outputs[0]
 	srcData := src.Float32s()
@@ -1102,9 +1200,6 @@ func (transposeOp) Execute(inputs, outputs []*Tensor) error {
 
 	shape := src.shape
 	ndims := len(shape)
-
-	// Derive permutation from output shape comparison
-	// Convention: perm is encoded such that dst.shape[i] = src.shape[perm[i]]
 	dstShape := dst.shape
 
 	// Compute source strides in elements
@@ -1121,15 +1216,19 @@ func (transposeOp) Execute(inputs, outputs []*Tensor) error {
 		dstStrides[i] = dstStrides[i+1] * dstShape[i+1]
 	}
 
-	// Build perm from shapes: find which src dim maps to each dst dim
-	perm := [8]int{}
-	used := [8]bool{}
-	for di := 0; di < ndims; di++ {
-		for si := 0; si < ndims; si++ {
-			if !used[si] && dstShape[di] == shape[si] {
-				perm[di] = si
-				used[si] = true
-				break
+	// Use permutation from attrs if available, otherwise derive from shapes
+	perm := op.perm
+	if op.ndim == 0 {
+		// Fallback: derive permutation from output shape comparison
+		// This only works correctly if all dimensions have distinct sizes
+		used := [8]bool{}
+		for di := 0; di < ndims; di++ {
+			for si := 0; si < ndims; si++ {
+				if !used[si] && dstShape[di] == shape[si] {
+					perm[di] = si
+					used[si] = true
+					break
+				}
 			}
 		}
 	}
@@ -1153,7 +1252,7 @@ func (transposeOp) Execute(inputs, outputs []*Tensor) error {
 	return nil
 }
 
-func (transposeOp) OutputShape(in []Shape) ([]Shape, error) {
+func (op *transposeOp) OutputShape(in []Shape) ([]Shape, error) {
 	return inferOpOutputShapes(OpTranspose, in, nil)
 }
 
@@ -1322,26 +1421,38 @@ func (splitOp) OutputShape(in []Shape) ([]Shape, error) {
 type divOp struct{}
 
 func (divOp) Execute(inputs, outputs []*Tensor) error {
-	a := inputs[0].Float32s()
-	b := inputs[1].Float32s()
-	dst := outputs[0].Float32s()
+	inA, inB, out := inputs[0], inputs[1], outputs[0]
+	a := inA.Float32s()
+	b := inB.Float32s()
+	dst := out.Float32s()
 
 	if len(a) == len(b) {
-		// Same shape — element-wise
 		for i := range dst {
 			dst[i] = a[i] / b[i]
 		}
 	} else if len(b) == 1 {
-		// Scalar broadcast
 		invB := 1.0 / b[0]
 		for i := range dst {
 			dst[i] = a[i] * invB
 		}
-	} else {
-		// General broadcast (match addOp pattern)
+	} else if len(a) == 1 {
+		scalar := a[0]
+		for i := range dst {
+			dst[i] = scalar / b[i]
+		}
+	} else if len(inA.shape) > 1 || len(inB.shape) > 1 {
+		// N-dimensional broadcasting using shapes
+		broadcastBinOp(inA.shape, inB.shape, out.shape, a, b, dst, func(av, bv float32) float32 { return av / bv })
+	} else if len(b) < len(a) && len(a)%len(b) == 0 {
 		for i := range dst {
 			dst[i] = a[i] / b[i%len(b)]
 		}
+	} else if len(a) < len(b) && len(b)%len(a) == 0 {
+		for i := range dst {
+			dst[i] = a[i%len(a)] / b[i]
+		}
+	} else {
+		return fmt.Errorf("div: incompatible sizes %d and %d", len(a), len(b))
 	}
 	return nil
 }
