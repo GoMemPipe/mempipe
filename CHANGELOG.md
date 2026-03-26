@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/GoMemPipe/mempipe/compare/mempipe-v1.1.0...mempipe-v1.1.1) (2026-03-26)
+
+
+### Bug Fixes
+
+* update build path for memlint binary in release workflow ([77d747f](https://github.com/GoMemPipe/mempipe/commit/77d747f657a6db273d674d6ae376751adce03d7e))
+* update build path for memlint binary in release workflow ([0e8d3cc](https://github.com/GoMemPipe/mempipe/commit/0e8d3ccfa14bd966100fe795df81e0ae2e26f173))
+
 ## [1.1.0](https://github.com/GoMemPipe/mempipe/compare/mempipe-v1.0.1...mempipe-v1.1.0) (2026-03-26)
 
 
