@@ -80,9 +80,11 @@ jobs:
             ARCH="armv7"
           fi
           SUFFIX="${{ matrix.suffix }}"
+          cd tools/memlint
           go build -trimpath -ldflags="-s -w" \
-            -o "memlint-${{ matrix.goos }}-${ARCH}${SUFFIX}" \
-            ./tools/memlint/cmd/memlint
+            -o "../../memlint-${{ matrix.goos }}-${ARCH}${SUFFIX}" \
+            ./cmd/memlint
+          cd ../..
           chmod +x memlint-*
 
       - name: Upload artifact
