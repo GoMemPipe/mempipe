@@ -781,3 +781,393 @@ func bytesToFloat32s(b []byte) []float32 {
 	}
 	return f
 }
+
+func int8sToBytes(v []int8) []byte {
+	b := make([]byte, len(v))
+	for i, x := range v {
+		b[i] = byte(x)
+	}
+	return b
+}
+
+func float16sToBytes(v []uint16) []byte {
+	b := make([]byte, len(v)*2)
+	for i, x := range v {
+		b[i*2+0] = byte(x)
+		b[i*2+1] = byte(x >> 8)
+	}
+	return b
+}
+
+// ── Multi-precision engine tests ──
+
+// TestWeightDType verifies that Model.WeightDType() returns the correct dtype.
+func TestWeightDType(t *testing.T) {
+	tests := []struct {
+		method string
+		want   DType
+	}{
+		{"", Float32},
+		{"int8_symmetric", Int8},
+		{"int8_asymmetric", Int8},
+		{"fp16", Float16},
+	}
+	for _, tt := range tests {
+		m := &Model{Metadata: Metadata{QuantMethod: tt.method}}
+		if got := m.WeightDType(); got != tt.want {
+			t.Errorf("QuantMethod=%q: WeightDType()=%v, want %v", tt.method, got, tt.want)
+		}
+	}
+}
+
+// TestEngineInt8Weights verifies the engine loads INT8 weight tensors
+// with correct dtype, stride, and byte size — no dequantization.
+func TestEngineInt8Weights(t *testing.T) {
+	// Simple model: output = ReLU(input * W_int8 + bias_int8)
+	// W: [4,3] int8, bias: [3] int8 → 15 bytes total
+	wData := []int8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	bData := []int8{1, -1, 0}
+
+	var blobBytes []byte
+	blobBytes = append(blobBytes, int8sToBytes(wData)...)
+	blobBytes = append(blobBytes, int8sToBytes(bData)...)
+
+	model := &Model{
+		Metadata: Metadata{
+			Name:         "int8-test",
+			InputShapes:  []Shape{{Dims: []int{1, 4}}},
+			OutputShapes: []Shape{{Dims: []int{1, 3}}},
+			QuantMethod:  "int8_symmetric",
+			QuantScale:   0.1,
+		},
+		TensorNames: []string{"input", "w1", "b1", "h1", "output"},
+		TensorShapes: map[string]Shape{
+			"w1": {Dims: []int{4, 3}},
+			"b1": {Dims: []int{3}},
+		},
+		Graph: []OpNode{
+			{Type: OpAdd, InputIndices: []int{0, 1}, OutputIndices: []int{3}},
+			{Type: OpReLU, InputIndices: []int{3}, OutputIndices: []int{4}},
+		},
+		WeightsBlob: blobBytes,
+	}
+
+	engine, err := NewEngine(model)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Verify weight tensor has Int8 dtype
+	w1, ok := engine.Tensor("w1")
+	if !ok {
+		t.Fatal("w1 tensor not found")
+	}
+	if w1.DType() != Int8 {
+		t.Errorf("w1 dtype: got %v, want Int8", w1.DType())
+	}
+	if w1.ByteSize() != 12 { // 4*3*1
+		t.Errorf("w1 byte size: got %d, want 12", w1.ByteSize())
+	}
+
+	// Verify the int8 data is loaded correctly (native, not dequantized)
+	w1Data := w1.Int8s()
+	for i, want := range wData {
+		if w1Data[i] != want {
+			t.Errorf("w1[%d]: got %d, want %d", i, w1Data[i], want)
+		}
+	}
+
+	// Verify bias tensor
+	b1, ok := engine.Tensor("b1")
+	if !ok {
+		t.Fatal("b1 tensor not found")
+	}
+	if b1.DType() != Int8 {
+		t.Errorf("b1 dtype: got %v, want Int8", b1.DType())
+	}
+	if b1.ByteSize() != 3 { // 3*1
+		t.Errorf("b1 byte size: got %d, want 3", b1.ByteSize())
+	}
+
+	// Verify activation tensors remain Float32
+	h1, ok := engine.Tensor("h1")
+	if !ok {
+		t.Fatal("h1 tensor not found")
+	}
+	if h1.DType() != Float32 {
+		t.Errorf("h1 dtype: got %v, want Float32", h1.DType())
+	}
+
+	// Verify strides are correct for INT8 (byte-level)
+	expectedStrides := computeStrides([]int{4, 3}, Int8)
+	for i, s := range w1.Strides() {
+		if s != expectedStrides[i] {
+			t.Errorf("w1 stride[%d]: got %d, want %d", i, s, expectedStrides[i])
+		}
+	}
+}
+
+// TestEngineFP16Weights verifies the engine loads FP16 weight tensors
+// with correct dtype, stride, and byte size — no dequantization.
+func TestEngineFP16Weights(t *testing.T) {
+	// W: [4,3] fp16, bias: [3] fp16 → 30 bytes total
+	wF32 := []float32{0.1, 0.2, -0.1, 0.3, -0.2, 0.4, -0.3, 0.1, 0.2, 0.2, 0.3, -0.4}
+	bF32 := []float32{0.01, -0.01, 0.02}
+
+	var fp16Vals []uint16
+	for _, v := range wF32 {
+		fp16Vals = append(fp16Vals, F32ToF16Bits(v))
+	}
+	for _, v := range bF32 {
+		fp16Vals = append(fp16Vals, F32ToF16Bits(v))
+	}
+	blobBytes := float16sToBytes(fp16Vals)
+
+	model := &Model{
+		Metadata: Metadata{
+			Name:         "fp16-test",
+			InputShapes:  []Shape{{Dims: []int{1, 4}}},
+			OutputShapes: []Shape{{Dims: []int{1, 3}}},
+			QuantMethod:  "fp16",
+		},
+		TensorNames: []string{"input", "w1", "b1", "h1", "output"},
+		TensorShapes: map[string]Shape{
+			"w1": {Dims: []int{4, 3}},
+			"b1": {Dims: []int{3}},
+		},
+		Graph: []OpNode{
+			{Type: OpAdd, InputIndices: []int{0, 1}, OutputIndices: []int{3}},
+			{Type: OpReLU, InputIndices: []int{3}, OutputIndices: []int{4}},
+		},
+		WeightsBlob: blobBytes,
+	}
+
+	engine, err := NewEngine(model)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Verify weight tensor has Float16 dtype
+	w1, ok := engine.Tensor("w1")
+	if !ok {
+		t.Fatal("w1 tensor not found")
+	}
+	if w1.DType() != Float16 {
+		t.Errorf("w1 dtype: got %v, want Float16", w1.DType())
+	}
+	if w1.ByteSize() != 24 { // 4*3*2
+		t.Errorf("w1 byte size: got %d, want 24", w1.ByteSize())
+	}
+
+	// Verify the FP16 data is loaded correctly (native, not converted to f32)
+	w1Data := w1.Float16s()
+	for i, wantF32 := range wF32 {
+		wantBits := F32ToF16Bits(wantF32)
+		if w1Data[i] != wantBits {
+			t.Errorf("w1[%d]: got 0x%04x, want 0x%04x (f32=%f)", i, w1Data[i], wantBits, wantF32)
+		}
+	}
+
+	// Verify bias tensor
+	b1, ok := engine.Tensor("b1")
+	if !ok {
+		t.Fatal("b1 tensor not found")
+	}
+	if b1.DType() != Float16 {
+		t.Errorf("b1 dtype: got %v, want Float16", b1.DType())
+	}
+	if b1.ByteSize() != 6 { // 3*2
+		t.Errorf("b1 byte size: got %d, want 6", b1.ByteSize())
+	}
+
+	// Verify strides are correct for FP16 (2-byte elements)
+	expectedStrides := computeStrides([]int{4, 3}, Float16)
+	for i, s := range w1.Strides() {
+		if s != expectedStrides[i] {
+			t.Errorf("w1 stride[%d]: got %d, want %d", i, s, expectedStrides[i])
+		}
+	}
+
+	// Verify memory alignment: FP16 tensor data pointer must be 2-byte aligned
+	if uintptr(w1.DataPtr())%2 != 0 {
+		t.Error("w1 data pointer is not 2-byte aligned")
+	}
+}
+
+// TestFloat16TensorAccessors verifies AtF16, SetF16, and Float16s methods.
+func TestFloat16TensorAccessors(t *testing.T) {
+	arena := NewInferenceArena(4096)
+	tensor, err := arena.AllocTensor("fp16_test", []int{2, 3}, Float16)
+	if err != nil {
+		t.Fatalf("alloc: %v", err)
+	}
+	if tensor.NumElements() != 6 {
+		t.Errorf("num elements: got %d, want 6", tensor.NumElements())
+	}
+	if tensor.ByteSize() != 12 { // 6 * 2
+		t.Errorf("byte size: got %d, want 12", tensor.ByteSize())
+	}
+
+	// Test SetF16 / AtF16
+	val1 := F32ToF16Bits(3.14)
+	val2 := F32ToF16Bits(-2.5)
+	tensor.SetF16(val1, 0, 0)
+	tensor.SetF16(val2, 1, 2)
+	if got := tensor.AtF16(0, 0); got != val1 {
+		t.Errorf("AtF16(0,0): got 0x%04x, want 0x%04x", got, val1)
+	}
+	if got := tensor.AtF16(1, 2); got != val2 {
+		t.Errorf("AtF16(1,2): got 0x%04x, want 0x%04x", got, val2)
+	}
+
+	// Test Float16s bulk access
+	data := tensor.Float16s()
+	if len(data) != 6 {
+		t.Fatalf("Float16s len: got %d, want 6", len(data))
+	}
+	if data[0] != val1 {
+		t.Errorf("Float16s[0]: got 0x%04x, want 0x%04x", data[0], val1)
+	}
+	// index [1,2] = 1*3+2 = 5
+	if data[5] != val2 {
+		t.Errorf("Float16s[5]: got 0x%04x, want 0x%04x", data[5], val2)
+	}
+
+	// Verify round-trip through FP16 bits
+	got1 := F16BitsToF32(tensor.AtF16(0, 0))
+	got2 := F16BitsToF32(tensor.AtF16(1, 2))
+	if d := math.Abs(float64(got1 - 3.14)); d > 0.01 {
+		t.Errorf("F16 round-trip 3.14: got %f", got1)
+	}
+	if d := math.Abs(float64(got2 - (-2.5))); d > 0.01 {
+		t.Errorf("F16 round-trip -2.5: got %f", got2)
+	}
+}
+
+// TestInt8TensorAlignment verifies INT8 tensor stride and alignment.
+func TestInt8TensorAlignment(t *testing.T) {
+	arena := NewInferenceArena(4096)
+	tensor, err := arena.AllocTensor("int8_test", []int{3, 4}, Int8)
+	if err != nil {
+		t.Fatalf("alloc: %v", err)
+	}
+	if tensor.ByteSize() != 12 { // 3*4*1
+		t.Errorf("byte size: got %d, want 12", tensor.ByteSize())
+	}
+	// Strides for [3,4] Int8 should be [4, 1]
+	strides := tensor.Strides()
+	if strides[0] != 4 || strides[1] != 1 {
+		t.Errorf("strides: got %v, want [4, 1]", strides)
+	}
+	// Arena allocations are 64-byte aligned
+	if uintptr(tensor.DataPtr())%64 != 0 {
+		t.Error("int8 tensor data pointer is not 64-byte aligned")
+	}
+}
+
+// TestFP16MemoryAlignment verifies FP16 tensors are properly aligned.
+func TestFP16MemoryAlignment(t *testing.T) {
+	arena := NewInferenceArena(4096)
+	// Allocate an INT8 tensor first (odd number of elements) to test alignment gap
+	_, err := arena.AllocTensor("int8_spacer", []int{7}, Int8)
+	if err != nil {
+		t.Fatalf("alloc spacer: %v", err)
+	}
+	// Next FP16 tensor must still be properly aligned
+	fp16, err := arena.AllocTensor("fp16_test", []int{4}, Float16)
+	if err != nil {
+		t.Fatalf("alloc fp16: %v", err)
+	}
+	if uintptr(fp16.DataPtr())%2 != 0 {
+		t.Error("fp16 tensor after odd int8 tensor is not 2-byte aligned")
+	}
+	// Should be 64-byte aligned (arena policy)
+	if uintptr(fp16.DataPtr())%64 != 0 {
+		t.Error("fp16 tensor is not 64-byte aligned (arena policy enforces this)")
+	}
+}
+
+// TestEngineInt8ReshapeInputs verifies ReshapeInputs works with INT8 weight tensors.
+func TestEngineInt8ReshapeInputs(t *testing.T) {
+	wData := []int8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	bData := []int8{1, -1, 0}
+
+	var blobBytes []byte
+	blobBytes = append(blobBytes, int8sToBytes(wData)...)
+	blobBytes = append(blobBytes, int8sToBytes(bData)...)
+
+	model := &Model{
+		Metadata: Metadata{
+			Name:         "int8-reshape-test",
+			InputShapes:  []Shape{{Dims: []int{1, 4}}},
+			OutputShapes: []Shape{{Dims: []int{1, 3}}},
+			QuantMethod:  "int8_symmetric",
+		},
+		TensorNames: []string{"input", "w1", "b1", "h1", "output"},
+		TensorShapes: map[string]Shape{
+			"w1": {Dims: []int{4, 3}},
+			"b1": {Dims: []int{3}},
+		},
+		Graph: []OpNode{
+			{Type: OpAdd, InputIndices: []int{0, 1}, OutputIndices: []int{3}},
+			{Type: OpReLU, InputIndices: []int{3}, OutputIndices: []int{4}},
+		},
+		WeightsBlob: blobBytes,
+	}
+
+	engine, err := NewEngine(model)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Weight should still be Int8 after reshape
+	w1, _ := engine.Tensor("w1")
+	if w1.DType() != Int8 {
+		t.Errorf("before reshape: w1 dtype=%v, want Int8", w1.DType())
+	}
+
+	// ReshapeInputs should not corrupt weight dtypes
+	err = engine.ReshapeInputs(map[string]Shape{
+		"input": {Dims: []int{1, 4}},
+	})
+	if err != nil {
+		t.Fatalf("ReshapeInputs: %v", err)
+	}
+
+	w1After, _ := engine.Tensor("w1")
+	if w1After.DType() != Int8 {
+		t.Errorf("after reshape: w1 dtype=%v, want Int8", w1After.DType())
+	}
+	if w1After.ByteSize() != 12 {
+		t.Errorf("after reshape: w1 byte size=%d, want 12", w1After.ByteSize())
+	}
+}
+
+// TestModelRoundTripFP16 verifies serialize/deserialize preserves fp16 quant method.
+func TestModelRoundTripFP16(t *testing.T) {
+	model := &Model{
+		Metadata: Metadata{
+			Name:         "fp16-roundtrip",
+			InputShapes:  []Shape{{Dims: []int{1, 10}}},
+			OutputShapes: []Shape{{Dims: []int{1, 10}}},
+			QuantMethod:  "fp16",
+		},
+		TensorNames: []string{"input", "output"},
+		Graph:       []OpNode{{Type: OpReLU, InputIndices: []int{0}, OutputIndices: []int{1}}},
+		WeightsBlob: make([]byte, 64),
+	}
+	data, err := SerializeModel(model)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	model2, err := LoadModelFromBytes(data)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if model2.Metadata.QuantMethod != "fp16" {
+		t.Errorf("quant method: got %q, want %q", model2.Metadata.QuantMethod, "fp16")
+	}
+	if model2.WeightDType() != Float16 {
+		t.Errorf("WeightDType: got %v, want Float16", model2.WeightDType())
+	}
+}

@@ -238,6 +238,34 @@ func (t *Tensor) Int32s() []int32 {
 	return unsafe.Slice((*int32)(t.data), n)
 }
 
+// Float16s returns the tensor's data as a uint16 slice of raw IEEE 754
+// half-precision bits (view into arena). Go has no native float16 type,
+// so raw bits are exposed. Use F16BitsToF32 / F32ToF16Bits for conversion.
+//
+//mem:hot
+func (t *Tensor) Float16s() []uint16 {
+	n := t.NumElements()
+	return unsafe.Slice((*uint16)(t.data), n)
+}
+
+// AtF16 reads a raw IEEE 754 half-precision value (uint16) at the given indices.
+//
+//mem:hot
+//mem:nogc
+func (t *Tensor) AtF16(indices ...int) uint16 {
+	ptr := unsafe.Add(t.data, t.linearOffset(indices))
+	return *(*uint16)(ptr)
+}
+
+// SetF16 writes a raw IEEE 754 half-precision value (uint16) at the given indices.
+//
+//mem:hot
+//mem:nogc
+func (t *Tensor) SetF16(value uint16, indices ...int) {
+	ptr := unsafe.Add(t.data, t.linearOffset(indices))
+	*(*uint16)(ptr) = value
+}
+
 // Bytes returns the tensor's raw bytes (view into arena).
 //
 //mem:hot

@@ -194,6 +194,19 @@ type Model struct {
 	WeightsBlob  []byte           // raw weight bytes (64-byte aligned)
 }
 
+// WeightDType returns the DType used for weight tensors based on the model's
+// quantization method. Returns Float32 if no quantization is specified.
+func (m *Model) WeightDType() DType {
+	switch m.Metadata.QuantMethod {
+	case "int8_symmetric", "int8_asymmetric":
+		return Int8
+	case "fp16":
+		return Float16
+	default:
+		return Float32
+	}
+}
+
 // InputSize returns the total number of float32 input elements.
 func (m *Model) InputSize() int {
 	total := 0
