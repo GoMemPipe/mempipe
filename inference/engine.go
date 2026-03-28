@@ -99,7 +99,9 @@ func (e *Engine) compile(cfg engineConfig) error {
 	//    Convention: _pack_weights iterates tensor_names in order and packs
 	//    every tensor that is an initializer (weight / constant).  Graph
 	//    inputs (first N tensor names) are never packed.
+	//    Weight dtype is derived from the model's quantization metadata.
 	numInputs := len(model.Metadata.InputShapes)
+	weightDType := model.WeightDType()
 	isWeight := make(map[string]bool)
 	{
 		cursor := 0
@@ -112,7 +114,7 @@ func (e *Engine) compile(cfg engineConfig) error {
 			if !ok {
 				continue
 			}
-			byteSize := s.NumElements() * Float32.Size()
+			byteSize := s.NumElements() * weightDType.Size()
 			if cursor+byteSize <= blobLen {
 				isWeight[name] = true
 				cursor += byteSize
@@ -150,7 +152,7 @@ func (e *Engine) compile(cfg engineConfig) error {
 	}
 
 	// 6. Create Tensor objects.
-	//    Weight tensors → point into the loaded weights region.
+	//    Weight tensors → point into the loaded weights region using native dtype.
 	//    Non-weight tensors → allocate fresh arena memory after the blob.
 	{
 		cursor := uintptr(0) // offset within the weights region
@@ -161,14 +163,14 @@ func (e *Engine) compile(cfg engineConfig) error {
 			}
 			if isWeight[name] {
 				// Map directly into the loaded weights region
-				byteSize := s.NumElements() * Float32.Size()
+				byteSize := s.NumElements() * weightDType.Size()
 				ptr := unsafe.Pointer(uintptr(weightsBase) + cursor)
-				strides := computeStrides(s.Dims, Float32)
+				strides := computeStrides(s.Dims, weightDType)
 				t := &Tensor{
 					data:    ptr,
 					shape:   s.Dims,
 					strides: strides,
-					dtype:   Float32,
+					dtype:   weightDType,
 					name:    name,
 					size:    byteSize,
 				}
