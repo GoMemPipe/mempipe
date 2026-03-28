@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.0](https://github.com/GoMemPipe/mempipe/compare/v1.2.0...v1.3.0) (2026-03-28)
+
+
+### Features
+
+* implement dynamic weight data types and add related tests ([ed3c7e3](https://github.com/GoMemPipe/mempipe/commit/ed3c7e37e34a23efde4bede3698247877e347370))
+* implement dynamic weight data types and add related tests ([3350e25](https://github.com/GoMemPipe/mempipe/commit/3350e25ddce7ad9b9e205514bab38d2045d2af21))
+
 ## [1.2.0](https://github.com/GoMemPipe/mempipe/compare/v1.1.1...v1.2.0) (2026-03-26)
 
 
