@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.0](https://github.com/GoMemPipe/mempipe/compare/v1.4.0...v1.5.0) (2026-03-29)
+
+
+### Features
+
+* implement Rotary Positional Embedding (RoPE) operator and relat… ([6f608d3](https://github.com/GoMemPipe/mempipe/commit/6f608d39441db23e016da6294c3675053629be22))
+* implement Rotary Positional Embedding (RoPE) operator and related tests ([0e88527](https://github.com/GoMemPipe/mempipe/commit/0e88527b6947c50253d3852f1d555f69ec9e91ed))
+
 ## [1.4.0](https://github.com/GoMemPipe/mempipe/compare/v1.3.0...v1.4.0) (2026-03-29)
 
 
