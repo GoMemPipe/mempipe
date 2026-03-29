@@ -81,22 +81,22 @@ func (t *Tensor) Shape() []int { return t.shape }
 // SetShape updates the tensor's shape and strides in-place without
 // reallocating memory. The new shape must require no more bytes than the
 // tensor's original allocation (t.size). This enables dynamic sequence
-// lengths: the arena is allocated for the maximum shape once, and callers
-// shrink the shape before each inference pass so operators only process
-// the active elements.
+// lengths: the arena is allocated for the maximum shape once (e.g. 8192
+// tokens for long-context models), and callers shrink the shape before
+// each inference pass so operators only process the active elements.
 //
 // Returns an error if the new shape would exceed the allocated byte budget.
 // Zero-alloc: reuses the existing shape/strides slices when lengths match.
 func (t *Tensor) SetShape(newShape []int) error {
-	newElems := 1
+	var newElems int64 = 1
 	for _, d := range newShape {
 		if d <= 0 {
 			return fmt.Errorf("invalid dimension %d in shape for tensor %q", d, t.name)
 		}
-		newElems *= d
+		newElems *= int64(d)
 	}
-	need := newElems * t.dtype.Size()
-	if need > t.size {
+	need := newElems * int64(t.dtype.Size())
+	if need > int64(t.size) {
 		return fmt.Errorf("SetShape: new shape requires %d bytes but tensor %q has %d allocated",
 			need, t.name, t.size)
 	}
@@ -431,6 +431,105 @@ func (t *Tensor) Slice(start, end int) (*Tensor, error) {
 	}, nil
 }
 
+// SliceLastDim returns a zero-copy view of the first `count` elements along
+// the last dimension. This is the primitive needed for Matryoshka
+// Representation Learning (MRL): a model produces a full embedding
+// (e.g. 768-d) and the caller slices it to a smaller dimensionality
+// (e.g. 256 or 128) without any copy or allocation.
+//
+// For a tensor of shape [..., D], SliceLastDim(n) returns a view with
+// shape [..., n] that shares the underlying arena memory. The returned
+// tensor retains the original strides for leading dimensions so that
+// per-row access (AtF32, SetF32) works correctly. The last dimension's
+// stride is unchanged (contiguous within each row).
+//
+// Note: Because SliceLastDim does not copy data, each row's n elements
+// are contiguous but rows may be spaced apart by the original D stride.
+// Use NarrowFloat32s() or per-element access for strided views.
+//
+// Panics: none. Returns an error for invalid arguments.
+func (t *Tensor) SliceLastDim(count int) (*Tensor, error) {
+	rank := len(t.shape)
+	if rank == 0 {
+		return nil, errors.New("SliceLastDim: cannot slice scalar tensor")
+	}
+	lastDim := t.shape[rank-1]
+	if count <= 0 || count > lastDim {
+		return nil, fmt.Errorf("SliceLastDim: count %d out of range [1, %d]", count, lastDim)
+	}
+
+	newShape := make([]int, rank)
+	copy(newShape, t.shape)
+	newShape[rank-1] = count
+
+	// Keep the original strides so row offsets are correct.
+	newStrides := make([]int, rank)
+	copy(newStrides, t.strides)
+
+	return &Tensor{
+		data:    t.data, // same base pointer — zero copy
+		shape:   newShape,
+		strides: newStrides,
+		dtype:   t.dtype,
+		name:    t.name,
+		size:    t.size, // keep original allocation size for safety
+	}, nil
+}
+
+// NarrowFloat32s extracts the Matryoshka-sliced (or any strided) tensor's
+// data into a contiguous float32 slice. For contiguous tensors this is
+// equivalent to Float32s(). For strided views (e.g. from SliceLastDim),
+// it copies only the active elements.
+func (t *Tensor) NarrowFloat32s() []float32 {
+	rank := len(t.shape)
+	if rank == 0 {
+		return nil
+	}
+
+	// Fast path: if the tensor is contiguous, just return the slice.
+	expectedStride := t.dtype.Size()
+	contiguous := true
+	for i := rank - 1; i >= 0; i-- {
+		if t.strides[i] != expectedStride {
+			contiguous = false
+			break
+		}
+		expectedStride *= t.shape[i]
+	}
+	if contiguous {
+		n := t.NumElements()
+		return unsafe.Slice((*float32)(t.data), n)
+	}
+
+	// Strided path: copy only active elements row by row.
+	total := t.NumElements()
+	result := make([]float32, total)
+	lastDim := t.shape[rank-1]
+
+	// Compute number of "rows" (everything except the last dim)
+	numRows := 1
+	for i := 0; i < rank-1; i++ {
+		numRows *= t.shape[i]
+	}
+
+	// Row stride in bytes = strides[rank-2] if rank >= 2, else strides[0]
+	var rowStrideBytes int
+	if rank >= 2 {
+		rowStrideBytes = t.strides[rank-2]
+	} else {
+		rowStrideBytes = lastDim * t.dtype.Size()
+	}
+
+	elemSize := t.dtype.Size()
+	for r := 0; r < numRows; r++ {
+		rowPtr := unsafe.Add(t.data, r*rowStrideBytes)
+		for c := 0; c < lastDim; c++ {
+			result[r*lastDim+c] = *(*float32)(unsafe.Add(rowPtr, c*elemSize))
+		}
+	}
+	return result
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Inference Arena — single allocation for all tensors
 // ────────────────────────────────────────────────────────────────────────────
@@ -457,15 +556,20 @@ func NewInferenceArena(size int) *InferenceArena {
 
 // AllocTensor reserves space in the arena for a tensor and returns it.
 // This is a build-time operation — not called on the hot path.
+// Uses int64 intermediate arithmetic to avoid overflow for tensors >1GB.
 func (a *InferenceArena) AllocTensor(name string, shape []int, dtype DType) (*Tensor, error) {
-	numElems := 1
+	var numElems int64 = 1
 	for _, d := range shape {
 		if d <= 0 {
 			return nil, fmt.Errorf("invalid dimension %d in shape for tensor %q", d, name)
 		}
-		numElems *= d
+		numElems *= int64(d)
 	}
-	byteSize := numElems * dtype.Size()
+	byteSize64 := numElems * int64(dtype.Size())
+	if byteSize64 > int64(maxInt) {
+		return nil, fmt.Errorf("tensor %q requires %d bytes, exceeds addressable range", name, byteSize64)
+	}
+	byteSize := int(byteSize64)
 
 	// Align offset to 64 bytes
 	a.offset = int(align64(uint64(a.offset)))
@@ -544,6 +648,8 @@ func (a *InferenceArena) Zero() {
 // ────────────────────────────────────────────────────────────────────────────
 
 // computeStrides returns row-major byte strides for the given shape and dtype.
+// Uses int64 internally to avoid overflow for large tensors before storing
+// the final result as int (validated to fit).
 func computeStrides(shape []int, dtype DType) []int {
 	if len(shape) == 0 {
 		return nil
@@ -554,6 +660,7 @@ func computeStrides(shape []int, dtype DType) []int {
 
 // computeStridesInto fills dst with the byte-strides for shape.
 // If dst has sufficient capacity, no allocation occurs.
+// Uses int64 arithmetic internally to safely handle large tensors.
 func computeStridesInto(dst []int, shape []int, dtype DType) []int {
 	n := len(shape)
 	if cap(dst) >= n {
@@ -561,13 +668,16 @@ func computeStridesInto(dst []int, shape []int, dtype DType) []int {
 	} else {
 		dst = make([]int, n)
 	}
-	stride := dtype.Size()
+	stride := int64(dtype.Size())
 	for i := n - 1; i >= 0; i-- {
-		dst[i] = stride
-		stride *= shape[i]
+		dst[i] = int(stride)
+		stride *= int64(shape[i])
 	}
 	return dst
 }
+
+// maxInt is the maximum value of int on the current platform.
+const maxInt = int(^uint(0) >> 1)
 
 // ────────────────────────────────────────────────────────────────────────────
 // Shape inference — compute intermediate tensor shapes from graph
@@ -954,6 +1064,12 @@ func inferOpOutputShapes(op OpType, inputs []Shape, attrs []byte) ([]Shape, erro
 	case OpHardSigmoid, OpHardSwish:
 		if len(inputs) < 1 {
 			return nil, errors.New("activation requires 1 input")
+		}
+		return []Shape{inputs[0]}, nil
+
+	case OpRoPE:
+		if len(inputs) < 1 {
+			return nil, errors.New("RoPE requires 1 input")
 		}
 		return []Shape{inputs[0]}, nil
 
