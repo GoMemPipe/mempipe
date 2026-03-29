@@ -1171,3 +1171,422 @@ func TestModelRoundTripFP16(t *testing.T) {
 		t.Errorf("WeightDType: got %v, want Float16", model2.WeightDType())
 	}
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// Tests for new DType-aware infrastructure
+// ══════════════════════════════════════════════════════════════════════════
+
+func TestEnsureFloat32_Float32PassThrough(t *testing.T) {
+	arena := NewInferenceArena(4096)
+	tensor, _ := arena.AllocTensor("f32", []int{4}, Float32)
+	data := tensor.Float32s()
+	data[0], data[1], data[2], data[3] = 1.0, 2.0, 3.0, 4.0
+
+	ef := tensor.EnsureFloat32()
+	if &ef[0] != &data[0] {
+		t.Error("EnsureFloat32 on Float32 tensor should return same slice")
+	}
+	for i, v := range ef {
+		if v != data[i] {
+			t.Errorf("EnsureFloat32[%d]: got %f, want %f", i, v, data[i])
+		}
+	}
+}
+
+func TestEnsureFloat32_Int8WithScratch(t *testing.T) {
+	arena := NewInferenceArena(8192)
+	// Create Int8 tensor manually
+	i8Tensor, _ := arena.AllocTensor("int8t", []int{4}, Int8)
+	i8Data := i8Tensor.Int8s()
+	i8Data[0], i8Data[1], i8Data[2], i8Data[3] = -127, 0, 64, 127
+
+	// Allocate scratch and set quant params
+	scratchPtr, _ := arena.AllocRaw(4 * Float32.Size())
+	i8Tensor.SetScratch(scratchPtr)
+	i8Tensor.SetQuantParams(1.0/127.0, 0)
+	i8Tensor.PopulateScratchFloat32()
+
+	ef := i8Tensor.EnsureFloat32()
+	if len(ef) != 4 {
+		t.Fatalf("EnsureFloat32 len: got %d, want 4", len(ef))
+	}
+	// -127 * (1/127) ≈ -1.0
+	if d := ef[0] - (-1.0); d > 0.01 || d < -0.01 {
+		t.Errorf("deq(-127): got %f, want ~-1.0", ef[0])
+	}
+	if ef[1] != 0.0 {
+		t.Errorf("deq(0): got %f, want 0.0", ef[1])
+	}
+	// 127 * (1/127) ≈ 1.0
+	if d := ef[3] - 1.0; d > 0.01 || d < -0.01 {
+		t.Errorf("deq(127): got %f, want ~1.0", ef[3])
+	}
+}
+
+func TestEnsureFloat32_FP16WithScratch(t *testing.T) {
+	arena := NewInferenceArena(8192)
+	fp16Tensor, _ := arena.AllocTensor("fp16t", []int{3}, Float16)
+	fp16Data := fp16Tensor.Float16s()
+	fp16Data[0] = F32ToF16Bits(0.0)
+	fp16Data[1] = F32ToF16Bits(1.0)
+	fp16Data[2] = F32ToF16Bits(-0.5)
+
+	scratchPtr, _ := arena.AllocRaw(3 * Float32.Size())
+	fp16Tensor.SetScratch(scratchPtr)
+	fp16Tensor.PopulateScratchFloat32()
+
+	ef := fp16Tensor.EnsureFloat32()
+	if ef[0] != 0.0 || ef[1] != 1.0 || ef[2] != -0.5 {
+		t.Errorf("FP16 EnsureFloat32: got %v, want [0, 1, -0.5]", ef)
+	}
+}
+
+func TestPerTensorQuantMetadataRoundTrip(t *testing.T) {
+	model := &Model{
+		Metadata: Metadata{
+			Name:         "per-tensor-quant",
+			InputShapes:  []Shape{{Dims: []int{1, 10}}},
+			OutputShapes: []Shape{{Dims: []int{1, 10}}},
+			QuantMethod:  "int8_symmetric",
+			QuantScale:   0.05,
+			QuantZero:    0,
+			TensorScales: map[string]float32{
+				"w1": 0.01,
+				"w2": 0.02,
+			},
+			TensorZeros: map[string]int32{
+				"w1": 3,
+				"w2": -2,
+			},
+		},
+		TensorNames: []string{"input", "output"},
+		Graph:       []OpNode{{Type: OpReLU, InputIndices: []int{0}, OutputIndices: []int{1}}},
+		WeightsBlob: make([]byte, 64),
+	}
+	data, err := SerializeModel(model)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	model2, err := LoadModelFromBytes(data)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(model2.Metadata.TensorScales) != 2 {
+		t.Fatalf("TensorScales: got %d entries", len(model2.Metadata.TensorScales))
+	}
+	if model2.Metadata.TensorScales["w1"] != 0.01 {
+		t.Errorf("w1 scale: got %f", model2.Metadata.TensorScales["w1"])
+	}
+	if model2.Metadata.TensorScales["w2"] != 0.02 {
+		t.Errorf("w2 scale: got %f", model2.Metadata.TensorScales["w2"])
+	}
+	if len(model2.Metadata.TensorZeros) != 2 {
+		t.Fatalf("TensorZeros: got %d entries", len(model2.Metadata.TensorZeros))
+	}
+	if model2.Metadata.TensorZeros["w1"] != 3 {
+		t.Errorf("w1 zero: got %d", model2.Metadata.TensorZeros["w1"])
+	}
+	if model2.Metadata.TensorZeros["w2"] != -2 {
+		t.Errorf("w2 zero: got %d", model2.Metadata.TensorZeros["w2"])
+	}
+	// Global fallback should still be preserved
+	if model2.Metadata.QuantScale != 0.05 {
+		t.Errorf("global scale: got %f", model2.Metadata.QuantScale)
+	}
+}
+
+func TestPerTensorQuantMetadataBackwardCompat(t *testing.T) {
+	// Model with no per-tensor maps: should decode without error
+	model := &Model{
+		Metadata: Metadata{
+			Name:         "old-format",
+			InputShapes:  []Shape{{Dims: []int{1, 10}}},
+			OutputShapes: []Shape{{Dims: []int{1, 10}}},
+			QuantMethod:  "int8_symmetric",
+			QuantScale:   0.05,
+		},
+		TensorNames: []string{"input", "output"},
+		Graph:       []OpNode{{Type: OpReLU, InputIndices: []int{0}, OutputIndices: []int{1}}},
+		WeightsBlob: make([]byte, 64),
+	}
+	data, err := SerializeModel(model)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	model2, err := LoadModelFromBytes(data)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if model2.Metadata.QuantScale != 0.05 {
+		t.Errorf("expected global scale 0.05, got %f", model2.Metadata.QuantScale)
+	}
+}
+
+func TestSnapshotRestoreRegistry(t *testing.T) {
+	// Take snapshot
+	snap := SnapshotRegistry()
+
+	// Verify a known op exists
+	_, err := GetOperator(OpReLU)
+	if err != nil {
+		t.Fatalf("GetOperator(ReLU) before: %v", err)
+	}
+
+	// Override ReLU with a custom noop
+	called := false
+	RegisterOperator(OpReLU, func() Operator {
+		return &testNoopOp{fn: func() { called = true }}
+	})
+	op, _ := GetOperator(OpReLU)
+	op.Execute(nil, nil)
+	if !called {
+		t.Error("override not active")
+	}
+
+	// Restore
+	RestoreRegistry(snap)
+	op2, _ := GetOperator(OpReLU)
+	// Should be original reluOp, not the override
+	if _, ok := op2.(*reluOp); !ok {
+		t.Errorf("expected *reluOp after restore, got %T", op2)
+	}
+}
+
+type testNoopOp struct {
+	fn func()
+}
+
+func (op *testNoopOp) Execute(_, _ []*Tensor) error {
+	if op.fn != nil {
+		op.fn()
+	}
+	return nil
+}
+func (op *testNoopOp) OutputShape(in []Shape) ([]Shape, error) {
+	if len(in) > 0 {
+		return []Shape{in[0]}, nil
+	}
+	return nil, nil
+}
+
+func TestNewEngineWithOverrides(t *testing.T) {
+	model := buildSimpleMLP(t)
+
+	// Custom operator that records it was called
+	executeCalled := 0
+	overrides := &EngineOverrides{
+		Operators: map[OpType]func() Operator{
+			OpSoftmax: func() Operator {
+				return &testCountingOp{count: &executeCalled}
+			},
+		},
+	}
+
+	engine, err := NewEngineWithOverrides(model, overrides)
+	if err != nil {
+		t.Fatalf("NewEngineWithOverrides: %v", err)
+	}
+
+	inputData := float32sToBytes([]float32{1.0, 0.5, -0.5, -1.0})
+	_, err = engine.Infer(inputData)
+	if err != nil {
+		t.Fatalf("Infer: %v", err)
+	}
+	if executeCalled == 0 {
+		t.Error("override operator was never called")
+	}
+}
+
+type testCountingOp struct {
+	count *int
+}
+
+func (op *testCountingOp) Execute(inputs, outputs []*Tensor) error {
+	*op.count++
+	// Copy input to output (passthrough)
+	if len(inputs) > 0 && len(outputs) > 0 {
+		src := inputs[0].EnsureFloat32()
+		dst := outputs[0].Float32s()
+		copy(dst, src)
+	}
+	return nil
+}
+func (op *testCountingOp) OutputShape(in []Shape) ([]Shape, error) {
+	if len(in) > 0 {
+		return []Shape{in[0]}, nil
+	}
+	return nil, nil
+}
+
+func TestDTypeAwareInterface(t *testing.T) {
+	// dequantizeOp implements DTypeAware
+	op := &dequantizeOp{}
+	info := &DTypeInfo{
+		InputDTypes:  []DType{Int8},
+		OutputDTypes: []DType{Float32},
+		InputNames:   []string{"w1"},
+		OutputNames:  []string{"deq_w1"},
+		TensorScales: map[string]float32{"w1": 0.03},
+		TensorZeros:  map[string]int32{"w1": 5},
+		GlobalScale:  0.01,
+		GlobalZero:   0,
+	}
+	if err := op.SetDTypeInfo(info); err != nil {
+		t.Fatalf("SetDTypeInfo: %v", err)
+	}
+	if op.scale != 0.03 {
+		t.Errorf("expected per-tensor scale 0.03, got %f", op.scale)
+	}
+	if op.zero != 5 {
+		t.Errorf("expected per-tensor zero 5, got %d", op.zero)
+	}
+}
+
+func TestDTypeAwareGlobalFallback(t *testing.T) {
+	op := &dequantizeOp{}
+	info := &DTypeInfo{
+		InputDTypes:  []DType{Int8},
+		OutputDTypes: []DType{Float32},
+		InputNames:   []string{"w_unknown"},
+		OutputNames:  []string{"deq_out"},
+		TensorScales: map[string]float32{}, // no per-tensor entry
+		TensorZeros:  map[string]int32{},
+		GlobalScale:  0.05,
+		GlobalZero:   2,
+	}
+	if err := op.SetDTypeInfo(info); err != nil {
+		t.Fatalf("SetDTypeInfo: %v", err)
+	}
+	if op.scale != 0.05 {
+		t.Errorf("expected global fallback scale 0.05, got %f", op.scale)
+	}
+	if op.zero != 2 {
+		t.Errorf("expected global fallback zero 2, got %d", op.zero)
+	}
+}
+
+func TestDequantizeOpUsesPerTensorScale(t *testing.T) {
+	arena := NewInferenceArena(8192)
+	src, _ := arena.AllocTensor("src", []int{3}, Int8)
+	dst, _ := arena.AllocTensor("dst", []int{3}, Float32)
+
+	scale := float32(0.05)
+	zero := int32(2)
+	src.SetQuantParams(scale, zero)
+
+	sd := src.Int8s()
+	sd[0], sd[1], sd[2] = -10, 2, 50
+
+	op := &dequantizeOp{scale: scale, zero: zero}
+	if err := op.Execute([]*Tensor{src}, []*Tensor{dst}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	dd := dst.Float32s()
+	// (-10 - 2) * 0.05 = -0.6
+	if d := dd[0] - (-0.6); d > 0.001 || d < -0.001 {
+		t.Errorf("deq[0]: got %f, want -0.6", dd[0])
+	}
+	// (2 - 2) * 0.05 = 0.0
+	if dd[1] != 0.0 {
+		t.Errorf("deq[1]: got %f, want 0.0", dd[1])
+	}
+	// (50 - 2) * 0.05 = 2.4
+	if d := dd[2] - 2.4; d > 0.001 || d < -0.001 {
+		t.Errorf("deq[2]: got %f, want 2.4", dd[2])
+	}
+}
+
+func TestEngineInt8WithPerTensorScales(t *testing.T) {
+	// Build a simple model with INT8 weights and per-tensor scales
+	// Model: input [1,3] → Dense(W[3,2], bias[2]) → ReLU → output [1,2]
+	wData := []int8{10, 20, 30, 40, 50, 60} // 3x2 weight matrix
+	bData := []int8{5, -5}                  // bias
+
+	wBlob := make([]byte, 8) // 6 (w) + 2 (b)
+	for i, v := range wData {
+		wBlob[i] = byte(v)
+	}
+	for i, v := range bData {
+		wBlob[6+i] = byte(v)
+	}
+
+	model := &Model{
+		Metadata: Metadata{
+			Name:         "int8-pertensor",
+			InputShapes:  []Shape{{Dims: []int{1, 3}}},
+			OutputShapes: []Shape{{Dims: []int{1, 2}}},
+			QuantMethod:  "int8_symmetric",
+			QuantScale:   0.01, // global fallback
+			TensorScales: map[string]float32{
+				"w1":   0.1,
+				"bias": 0.05,
+			},
+		},
+		TensorNames:  []string{"input", "w1", "bias", "dense_out", "output"},
+		TensorShapes: map[string]Shape{"w1": {Dims: []int{3, 2}}, "bias": {Dims: []int{2}}},
+		Graph: []OpNode{
+			{Type: OpDense, InputIndices: []int{0, 1, 2}, OutputIndices: []int{3}},
+			{Type: OpReLU, InputIndices: []int{3}, OutputIndices: []int{4}},
+		},
+		WeightsBlob: wBlob,
+	}
+
+	engine, err := NewEngine(model)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	// Verify per-tensor scale was applied
+	w1Tensor, ok := engine.Tensor("w1")
+	if !ok {
+		t.Fatal("w1 tensor not found")
+	}
+	if w1Tensor.QuantScale() != 0.1 {
+		t.Errorf("w1 scale: got %f, want 0.1", w1Tensor.QuantScale())
+	}
+
+	biasTensor, ok := engine.Tensor("bias")
+	if !ok {
+		t.Fatal("bias tensor not found")
+	}
+	if biasTensor.QuantScale() != 0.05 {
+		t.Errorf("bias scale: got %f, want 0.05", biasTensor.QuantScale())
+	}
+
+	// Verify EnsureFloat32 gives correct dequantized values
+	wF32 := w1Tensor.EnsureFloat32()
+	// wData[0] = 10, scale = 0.1, zero = 0 → 1.0
+	if d := wF32[0] - 1.0; d > 0.001 || d < -0.001 {
+		t.Errorf("w1 EnsureFloat32[0] = %f, want 1.0", wF32[0])
+	}
+
+	// Run inference: input = [1.0, 0.0, 0.0]
+	inputData := float32sToBytes([]float32{1.0, 0.0, 0.0})
+	output, err := engine.Infer(inputData)
+	if err != nil {
+		t.Fatalf("Infer: %v", err)
+	}
+	outFloats := bytesToFloat32s(output)
+	// Dense: [1,0,0] × [[1,2],[3,4],[5,6]] + [0.25, -0.25] = [1.25, 1.75]
+	// (w values: 10*0.1=1, 20*0.1=2, 30*0.1=3, 40*0.1=4, 50*0.1=5, 60*0.1=6)
+	// (bias values: 5*0.05=0.25, -5*0.05=-0.25)
+	// ReLU applied: [1.25, 1.75]
+	if d := outFloats[0] - 1.25; d > 0.01 || d < -0.01 {
+		t.Errorf("output[0] = %f, want ~1.25", outFloats[0])
+	}
+	if d := outFloats[1] - 1.75; d > 0.01 || d < -0.01 {
+		t.Errorf("output[1] = %f, want ~1.75", outFloats[1])
+	}
+}
+
+func TestQuantParamAccessors(t *testing.T) {
+	arena := NewInferenceArena(4096)
+	tensor, _ := arena.AllocTensor("test", []int{4}, Int8)
+	tensor.SetQuantParams(0.05, 3)
+	if tensor.QuantScale() != 0.05 {
+		t.Errorf("QuantScale: got %f, want 0.05", tensor.QuantScale())
+	}
+	if tensor.QuantZero() != 3 {
+		t.Errorf("QuantZero: got %d, want 3", tensor.QuantZero())
+	}
+}

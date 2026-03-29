@@ -72,13 +72,15 @@ type fileHeader struct {
 
 // Metadata describes the model's top-level properties.
 type Metadata struct {
-	Name          string  // model name (null-terminated in file)
-	InputShapes   []Shape // input tensor shapes
-	OutputShapes  []Shape // output tensor shapes
-	QuantMethod   string  // "", "int8_symmetric", "int8_asymmetric", "fp16"
-	QuantScale    float32 // global quantization scale (per-tensor)
-	QuantZero     int32   // global quantization zero-point
-	PlatformHints string  // e.g. "wasm", "arm64", ""
+	Name          string             // model name (null-terminated in file)
+	InputShapes   []Shape            // input tensor shapes
+	OutputShapes  []Shape            // output tensor shapes
+	QuantMethod   string             // "", "int8_symmetric", "int8_asymmetric", "fp16"
+	QuantScale    float32            // global quantization scale (fallback)
+	QuantZero     int32              // global quantization zero-point (fallback)
+	PlatformHints string             // e.g. "wasm", "arm64", ""
+	TensorScales  map[string]float32 // per-tensor quantization scales (overrides QuantScale)
+	TensorZeros   map[string]int32   // per-tensor quantization zero-points (overrides QuantZero)
 }
 
 // Shape represents a tensor's dimensions.
@@ -449,6 +451,20 @@ func encodeMetadata(md *Metadata) ([]byte, error) {
 	buf = appendU16(buf, uint16(len(md.PlatformHints)))
 	buf = append(buf, md.PlatformHints...)
 
+	// Per-tensor quantization parameters (v1.1 extension)
+	buf = appendU16(buf, uint16(len(md.TensorScales)))
+	for name, scale := range md.TensorScales {
+		buf = appendU16(buf, uint16(len(name)))
+		buf = append(buf, name...)
+		buf = appendF32(buf, scale)
+	}
+	buf = appendU16(buf, uint16(len(md.TensorZeros)))
+	for name, zero := range md.TensorZeros {
+		buf = appendU16(buf, uint16(len(name)))
+		buf = append(buf, name...)
+		buf = appendI32(buf, zero)
+	}
+
 	return buf, nil
 }
 
@@ -539,6 +555,59 @@ func decodeMetadata(data []byte) (Metadata, error) {
 		return md, errors.New("metadata platformHints truncated")
 	}
 	md.PlatformHints = string(data[off : off+int(phLen)])
+	off += int(phLen)
+
+	// Per-tensor quantization parameters (backward-compatible extension)
+	if off < len(data) {
+		numScales, newOff, e := readU16(data, off)
+		if e == nil {
+			off = newOff
+			md.TensorScales = make(map[string]float32, numScales)
+			for i := 0; i < int(numScales); i++ {
+				nl, o, e2 := readU16(data, off)
+				if e2 != nil {
+					break
+				}
+				off = o
+				if off+int(nl) > len(data) {
+					break
+				}
+				name := string(data[off : off+int(nl)])
+				off += int(nl)
+				scale, o2, e3 := readF32(data, off)
+				if e3 != nil {
+					break
+				}
+				off = o2
+				md.TensorScales[name] = scale
+			}
+		}
+	}
+	if off < len(data) {
+		numZeros, newOff, e := readU16(data, off)
+		if e == nil {
+			off = newOff
+			md.TensorZeros = make(map[string]int32, numZeros)
+			for i := 0; i < int(numZeros); i++ {
+				nl, o, e2 := readU16(data, off)
+				if e2 != nil {
+					break
+				}
+				off = o
+				if off+int(nl) > len(data) {
+					break
+				}
+				name := string(data[off : off+int(nl)])
+				off += int(nl)
+				zero, o2, e3 := readI32(data, off)
+				if e3 != nil {
+					break
+				}
+				off = o2
+				md.TensorZeros[name] = zero
+			}
+		}
+	}
 
 	return md, nil
 }
