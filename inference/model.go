@@ -154,6 +154,7 @@ const (
 	OpGlobalAvgPool2D // Global average pooling → [N,C,1,1]
 	OpHardSigmoid     // HardSigmoid activation
 	OpHardSwish       // HardSwish activation
+	OpRoPE            // Rotary Positional Embedding
 )
 
 // String returns the operator name.
@@ -168,6 +169,7 @@ func (o OpType) String() string {
 		"Tanh", "Where", "Split", "Div",
 		"Pow", "IsNaN", "And",
 		"GlobalAvgPool2D", "HardSigmoid", "HardSwish",
+		"RoPE",
 	}
 	if int(o) < len(names) {
 		return names[o]

@@ -127,7 +127,7 @@ func TestLayerNorm(t *testing.T) {
 
 func TestLayerNorm_3D(t *testing.T) {
 	// [batch=1, seq=2, hidden=4]
-	arena := NewInferenceArena((1*2*4 + 4 + 4 + 1*2*4) * 4 + 512)
+	arena := NewInferenceArena((1*2*4+4+4+1*2*4)*4 + 512)
 	x, _ := arena.AllocTensor("x", []int{1, 2, 4}, Float32)
 	gamma, _ := arena.AllocTensor("gamma", []int{4}, Float32)
 	beta, _ := arena.AllocTensor("beta", []int{4}, Float32)
@@ -161,7 +161,7 @@ func TestLayerNorm_3D(t *testing.T) {
 }
 
 func TestLayerNorm_ZeroAllocs(t *testing.T) {
-	arena := NewInferenceArena((128*768 + 768 + 768 + 128*768) * 4 + 1024)
+	arena := NewInferenceArena((128*768+768+768+128*768)*4 + 1024)
 	x, _ := arena.AllocTensor("x", []int{128, 768}, Float32)
 	gamma, _ := arena.AllocTensor("gamma", []int{768}, Float32)
 	beta, _ := arena.AllocTensor("beta", []int{768}, Float32)
@@ -233,7 +233,7 @@ func TestGather(t *testing.T) {
 }
 
 func TestGather_ZeroAllocs(t *testing.T) {
-	arena := NewInferenceArena((50000*768 + 128 + 128*768) * 4 + 1024)
+	arena := NewInferenceArena((50000*768+128+128*768)*4 + 1024)
 	weights, _ := arena.AllocTensor("w", []int{50000, 768}, Float32)
 	indices, _ := arena.AllocTensor("idx", []int{128}, Float32)
 	out, _ := arena.AllocTensor("out", []int{128, 768}, Float32)
@@ -423,7 +423,7 @@ func TestWhere(t *testing.T) {
 
 func TestSplit(t *testing.T) {
 	// Split [6, 4] along axis=0 into 3 parts of [2, 4]
-	arena := NewInferenceArena((6*4 + 2*4*3) * 4 + 512)
+	arena := NewInferenceArena((6*4+2*4*3)*4 + 512)
 	src, _ := arena.AllocTensor("src", []int{6, 4}, Float32)
 	out0, _ := arena.AllocTensor("o0", []int{2, 4}, Float32)
 	out1, _ := arena.AllocTensor("o1", []int{2, 4}, Float32)
@@ -536,5 +536,353 @@ func TestShapeInference_Transformer(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// ── RoPE tests ──
+
+func TestRoPE_Basic(t *testing.T) {
+	// 4D input: [batch=1, seq_len=4, num_heads=2, head_dim=4]
+	batch, seqLen, numHeads, headDim := 1, 4, 2, 4
+	total := batch * seqLen * numHeads * headDim
+	arenaSize := total * 4 * 2 // input + output
+	arena := NewInferenceArena(arenaSize + 512)
+
+	in, _ := arena.AllocTensor("in", []int{batch, seqLen, numHeads, headDim}, Float32)
+	out, _ := arena.AllocTensor("out", []int{batch, seqLen, numHeads, headDim}, Float32)
+
+	// Fill with sequential values
+	inData := in.Float32s()
+	for i := range inData {
+		inData[i] = float32(i) * 0.1
+	}
+
+	op := &ropeOp{baseFreq: 10000.0}
+	if err := op.Execute([]*Tensor{in}, []*Tensor{out}); err != nil {
+		t.Fatal(err)
+	}
+
+	outData := out.Float32s()
+
+	// Position 0: cos(0)=1, sin(0)=0, so output should match input
+	for h := 0; h < numHeads; h++ {
+		off := h * headDim
+		for d := 0; d < headDim; d++ {
+			if diff := math.Abs(float64(outData[off+d] - inData[off+d])); diff > 1e-5 {
+				t.Errorf("RoPE pos=0 head=%d dim=%d: got %f, want %f", h, d, outData[off+d], inData[off+d])
+			}
+		}
+	}
+
+	// Positions > 0 should differ from input (rotation applied)
+	seqStride := numHeads * headDim
+	for s := 1; s < seqLen; s++ {
+		off := s * seqStride
+		same := 0
+		for d := 0; d < numHeads*headDim; d++ {
+			if outData[off+d] == inData[off+d] {
+				same++
+			}
+		}
+		if same == numHeads*headDim {
+			t.Errorf("RoPE pos=%d: output identical to input (rotation not applied)", s)
+		}
+	}
+}
+
+func TestRoPE_3D(t *testing.T) {
+	// 3D input: [batch=1, seq_len=4, dim=8]
+	batch, seqLen, dim := 1, 4, 8
+	total := batch * seqLen * dim
+	arenaSize := total * 4 * 2
+	arena := NewInferenceArena(arenaSize + 512)
+
+	in, _ := arena.AllocTensor("in", []int{batch, seqLen, dim}, Float32)
+	out, _ := arena.AllocTensor("out", []int{batch, seqLen, dim}, Float32)
+
+	inData := in.Float32s()
+	for i := range inData {
+		inData[i] = 1.0
+	}
+
+	op := &ropeOp{baseFreq: 10000.0}
+	if err := op.Execute([]*Tensor{in}, []*Tensor{out}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Output shape should be preserved
+	outShape := out.Shape()
+	if len(outShape) != 3 || outShape[0] != 1 || outShape[1] != 4 || outShape[2] != 8 {
+		t.Errorf("RoPE 3D output shape: got %v", outShape)
+	}
+}
+
+func TestRoPE_OddHeadDim_Error(t *testing.T) {
+	arena := NewInferenceArena(1024)
+	in, _ := arena.AllocTensor("in", []int{1, 4, 3}, Float32) // dim=3 (odd)
+	out, _ := arena.AllocTensor("out", []int{1, 4, 3}, Float32)
+
+	op := &ropeOp{baseFreq: 10000.0}
+	err := op.Execute([]*Tensor{in}, []*Tensor{out})
+	if err == nil {
+		t.Error("expected error for odd head_dim")
+	}
+}
+
+func TestRoPE_ShapeInference(t *testing.T) {
+	shape := Shape{Dims: []int{1, 128, 12, 64}}
+	got, err := inferOpOutputShapes(OpRoPE, []Shape{shape}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[0].Equal(shape) {
+		t.Errorf("RoPE shape: got %v, want %v", got[0].Dims, shape.Dims)
+	}
+}
+
+func TestRoPE_DTypeAware(t *testing.T) {
+	op := &ropeOp{}
+	info := &DTypeInfo{
+		InputDTypes: []DType{Float16},
+	}
+	if err := op.SetDTypeInfo(info); err != nil {
+		t.Fatal(err)
+	}
+	if op.dtype != Float16 {
+		t.Errorf("expected dtype Float16, got %v", op.dtype)
+	}
+}
+
+func TestRoPE_SetAttrs(t *testing.T) {
+	op := &ropeOp{}
+	// No attrs — default base freq
+	if err := op.SetAttrs(nil); err != nil {
+		t.Fatal(err)
+	}
+	if op.baseFreq != 10000.0 {
+		t.Errorf("default baseFreq: got %f, want 10000.0", op.baseFreq)
+	}
+
+	// Custom base freq
+	attrs := make([]byte, 4)
+	bits := math.Float32bits(1000.0)
+	attrs[0] = byte(bits)
+	attrs[1] = byte(bits >> 8)
+	attrs[2] = byte(bits >> 16)
+	attrs[3] = byte(bits >> 24)
+	if err := op.SetAttrs(attrs); err != nil {
+		t.Fatal(err)
+	}
+	if op.baseFreq != 1000.0 {
+		t.Errorf("custom baseFreq: got %f, want 1000.0", op.baseFreq)
+	}
+}
+
+func TestRoPE_ZeroAllocs(t *testing.T) {
+	total := 1 * 32 * 4 * 64 // batch * seq * heads * dim
+	arena := NewInferenceArena(total*4*2 + 512)
+	in, _ := arena.AllocTensor("in", []int{1, 32, 4, 64}, Float32)
+	out, _ := arena.AllocTensor("out", []int{1, 32, 4, 64}, Float32)
+
+	for i := range in.Float32s() {
+		in.Float32s()[i] = float32(i) * 0.001
+	}
+
+	op := &ropeOp{baseFreq: 10000.0}
+	allocs := testing.AllocsPerRun(50, func() {
+		op.Execute([]*Tensor{in}, []*Tensor{out})
+	})
+	if allocs > 0 {
+		t.Errorf("RoPE Execute allocated: %f allocs", allocs)
+	}
+}
+
+// ── Matryoshka slicing tests ──
+
+func TestSliceLastDim(t *testing.T) {
+	arena := NewInferenceArena(2*768*4 + 512)
+	embed, _ := arena.AllocTensor("embed", []int{2, 768}, Float32)
+
+	data := embed.Float32s()
+	for i := range data {
+		data[i] = float32(i)
+	}
+
+	// Slice to 256 dims
+	sliced, err := embed.SliceLastDim(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	shape := sliced.Shape()
+	if len(shape) != 2 || shape[0] != 2 || shape[1] != 256 {
+		t.Fatalf("SliceLastDim shape: got %v, want [2, 256]", shape)
+	}
+
+	// Verify zero-copy: first element should be same pointer
+	if sliced.DataPtr() != embed.DataPtr() {
+		t.Error("SliceLastDim should be zero-copy (same base pointer)")
+	}
+
+	// Verify data via NarrowFloat32s: row 0 should be [0..255], row 1 should start at 768
+	slicedData := sliced.NarrowFloat32s()
+	for i := 0; i < 256; i++ {
+		if slicedData[i] != float32(i) {
+			t.Errorf("SliceLastDim row0[%d]: got %f, want %f", i, slicedData[i], float32(i))
+			break
+		}
+	}
+	for i := 0; i < 256; i++ {
+		want := float32(768 + i)
+		if slicedData[256+i] != want {
+			t.Errorf("SliceLastDim row1[%d]: got %f, want %f", i, slicedData[256+i], want)
+			break
+		}
+	}
+}
+
+func TestSliceLastDim_128(t *testing.T) {
+	arena := NewInferenceArena(1*768*4 + 512)
+	embed, _ := arena.AllocTensor("embed", []int{1, 768}, Float32)
+	data := embed.Float32s()
+	for i := range data {
+		data[i] = float32(i)
+	}
+
+	sliced, err := embed.SliceLastDim(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sliced.Shape()[1] != 128 {
+		t.Errorf("got dim %d, want 128", sliced.Shape()[1])
+	}
+}
+
+func TestSliceLastDim_3D(t *testing.T) {
+	arena := NewInferenceArena(2*4*768*4 + 512)
+	t3d, _ := arena.AllocTensor("t3d", []int{2, 4, 768}, Float32)
+	sliced, err := t3d.SliceLastDim(256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shape := sliced.Shape()
+	if len(shape) != 3 || shape[0] != 2 || shape[1] != 4 || shape[2] != 256 {
+		t.Errorf("SliceLastDim 3D: got %v, want [2, 4, 256]", shape)
+	}
+}
+
+func TestSliceLastDim_Errors(t *testing.T) {
+	arena := NewInferenceArena(1*768*4 + 512)
+	embed, _ := arena.AllocTensor("embed", []int{1, 768}, Float32)
+
+	// count = 0
+	if _, err := embed.SliceLastDim(0); err == nil {
+		t.Error("expected error for count=0")
+	}
+	// count > dim
+	if _, err := embed.SliceLastDim(1000); err == nil {
+		t.Error("expected error for count > dim")
+	}
+	// count < 0
+	if _, err := embed.SliceLastDim(-1); err == nil {
+		t.Error("expected error for negative count")
+	}
+}
+
+func TestSliceLastDim_FullDim(t *testing.T) {
+	arena := NewInferenceArena(1*768*4 + 512)
+	embed, _ := arena.AllocTensor("embed", []int{1, 768}, Float32)
+
+	sliced, err := embed.SliceLastDim(768)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sliced.Shape()[1] != 768 {
+		t.Errorf("full dim: got %d, want 768", sliced.Shape()[1])
+	}
+}
+
+// ── Arena overflow safety tests ──
+
+func TestArenaInt64Strides(t *testing.T) {
+	// Test that computeStrides handles large dimensions without int overflow.
+	// A tensor with shape [1, 8192, 1024, 1024] would have strides that
+	// require int64 intermediates on 32-bit systems.
+	shape := []int{1, 8192, 1024}
+	strides := computeStrides(shape, Float32)
+
+	// stride[2] = 4 (float32 size)
+	// stride[1] = 4 * 1024 = 4096
+	// stride[0] = 4096 * 8192 = 33554432
+	if strides[2] != 4 {
+		t.Errorf("stride[2]: got %d, want 4", strides[2])
+	}
+	if strides[1] != 4*1024 {
+		t.Errorf("stride[1]: got %d, want %d", strides[1], 4*1024)
+	}
+	if strides[0] != 4*1024*8192 {
+		t.Errorf("stride[0]: got %d, want %d", strides[0], 4*1024*8192)
+	}
+}
+
+func TestSetShape_Int64Safety(t *testing.T) {
+	// Allocate a tensor with a large shape, then SetShape to a smaller one
+	arena := NewInferenceArena(1024 * 1024) // 1MB
+	t1, err := arena.AllocTensor("big", []int{1, 256, 1024}, Float32)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Shrink to smaller shape
+	if err := t1.SetShape([]int{1, 128, 1024}); err != nil {
+		t.Errorf("SetShape to smaller should succeed: %v", err)
+	}
+
+	// Try to expand beyond allocation
+	if err := t1.SetShape([]int{1, 512, 1024}); err == nil {
+		t.Error("SetShape to larger should fail")
+	}
+}
+
+// ── Dynamic context window tests ──
+
+func TestDynamicContextWindow_8192(t *testing.T) {
+	// Verify that the engine supports allocating and reshaping tensors
+	// up to 8192 token context windows.
+	maxSeq := 8192
+	embedDim := 768
+
+	// Allocate arena big enough for max context
+	arenaSize := maxSeq * embedDim * 4 * 2 // input + output
+	arena := NewInferenceArena(arenaSize + 1024)
+
+	// Allocate at max size
+	in, err := arena.AllocTensor("in", []int{1, maxSeq, embedDim}, Float32)
+	if err != nil {
+		t.Fatalf("AllocTensor at maxSeq=%d: %v", maxSeq, err)
+	}
+
+	// SetShape to actual runtime size
+	if err := in.SetShape([]int{1, 128, embedDim}); err != nil {
+		t.Fatalf("SetShape to 128 tokens: %v", err)
+	}
+	if in.Shape()[1] != 128 {
+		t.Errorf("seq_len after reshape: got %d, want 128", in.Shape()[1])
+	}
+
+	// Reshape back to a different size
+	if err := in.SetShape([]int{1, 4096, embedDim}); err != nil {
+		t.Fatalf("SetShape to 4096 tokens: %v", err)
+	}
+	if in.Shape()[1] != 4096 {
+		t.Errorf("seq_len after reshape: got %d, want 4096", in.Shape()[1])
+	}
+
+	// Reshape to full 8192
+	if err := in.SetShape([]int{1, maxSeq, embedDim}); err != nil {
+		t.Fatalf("SetShape to %d tokens: %v", maxSeq, err)
+	}
+	if in.Shape()[1] != maxSeq {
+		t.Errorf("seq_len after reshape: got %d, want %d", in.Shape()[1], maxSeq)
 	}
 }

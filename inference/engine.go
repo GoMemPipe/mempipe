@@ -135,10 +135,10 @@ func (e *Engine) compile(cfg engineConfig) error {
 		}
 	}
 
-	// 3. Compute total arena size
+	// 3. Compute total arena size using int64 to avoid overflow for large models.
 	//    = weights (64B aligned) + all non-weight tensors (64B aligned each)
 	//    + scratch buffers for non-Float32 weight tensors (for EnsureFloat32)
-	arenaSize := int(align64(uint64(len(model.WeightsBlob))))
+	arenaSize64 := int64(align64(uint64(len(model.WeightsBlob))))
 
 	// Store the weight set on the engine for ReshapeInputs.
 	e.weightNames = isWeight
@@ -151,8 +151,8 @@ func (e *Engine) compile(cfg engineConfig) error {
 		if !ok {
 			continue
 		}
-		byteSize := s.NumElements() * Float32.Size()
-		arenaSize += int(align64(uint64(byteSize)))
+		byteSize := int64(s.NumElements()) * int64(Float32.Size())
+		arenaSize64 += int64(align64(uint64(byteSize)))
 	}
 
 	// Reserve scratch space for non-Float32 weight dequantization
@@ -162,12 +162,13 @@ func (e *Engine) compile(cfg engineConfig) error {
 			if !ok {
 				continue
 			}
-			scratchSize := s.NumElements() * Float32.Size()
-			arenaSize += int(align64(uint64(scratchSize)))
+			scratchSize := int64(s.NumElements()) * int64(Float32.Size())
+			arenaSize64 += int64(align64(uint64(scratchSize)))
 		}
 	}
 
-	arenaSize += cfg.extraArenaBytes
+	arenaSize64 += int64(cfg.extraArenaBytes)
+	arenaSize := int(arenaSize64)
 
 	// 4. Allocate single arena
 	e.arena = NewInferenceArena(arenaSize)
@@ -461,8 +462,9 @@ func (e *Engine) ArenaTotal() int { return e.arena.TotalBytes() }
 // their original arena memory — only the shape/strides metadata is updated.
 //
 // This enables dynamic sequence lengths: allocate once for the maximum length
-// (e.g. 512), then call ReshapeInputs with actual length before each
-// inference pass so operators only process active elements.
+// (e.g. 8192 for long-context models like nomic-embed-text-v1.5), then call
+// ReshapeInputs with actual length before each inference pass so operators
+// only process active elements.
 //
 // inputShapes maps tensor name → new Shape. Typically these are the model's
 // named inputs, but you may also include weight/constant tensor names

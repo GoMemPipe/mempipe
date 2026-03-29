@@ -169,6 +169,7 @@ func init() {
 	RegisterOperator(OpGlobalAvgPool2D, func() Operator { return &globalAvgPool2dOp{} })
 	RegisterOperator(OpHardSigmoid, func() Operator { return &hardSigmoidOp{} })
 	RegisterOperator(OpHardSwish, func() Operator { return &hardSwishOp{} })
+	RegisterOperator(OpRoPE, func() Operator { return &ropeOp{} })
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1789,4 +1790,189 @@ func (hardSwishOp) Execute(inputs, outputs []*Tensor) error {
 
 func (hardSwishOp) OutputShape(in []Shape) ([]Shape, error) {
 	return inferOpOutputShapes(OpHardSwish, in, nil)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// RoPE: Rotary Positional Embedding
+//
+// Applies rotary positional encoding to query/key tensors.
+// Input: [batch, seq_len, num_heads, head_dim]  (or [batch, num_heads, seq_len, head_dim])
+// Output: same shape with positional information encoded via rotation.
+//
+// Attrs: [base_freq_bits u32]  (defaults to 10000.0 if absent)
+//
+// Implements DTypeAware for FP32/FP16/INT8 dispatch.
+// ════════════════════════════════════════════════════════════════════════════
+
+type ropeOp struct {
+	baseFreq float32
+	dtype    DType
+}
+
+func (op *ropeOp) SetAttrs(attrs []byte) error {
+	op.baseFreq = 10000.0
+	if len(attrs) >= 4 {
+		op.baseFreq = math.Float32frombits(binary.LittleEndian.Uint32(attrs[0:4]))
+	}
+	if op.baseFreq <= 0 {
+		op.baseFreq = 10000.0
+	}
+	return nil
+}
+
+func (op *ropeOp) SetDTypeInfo(info *DTypeInfo) error {
+	if len(info.InputDTypes) > 0 {
+		op.dtype = info.InputDTypes[0]
+	}
+	return nil
+}
+
+func (op *ropeOp) Execute(inputs, outputs []*Tensor) error {
+	in := inputs[0]
+	out := outputs[0]
+
+	shape := in.shape
+	if len(shape) < 3 {
+		return fmt.Errorf("RoPE: input must be at least 3D, got %dD", len(shape))
+	}
+
+	// Support both [batch, seq_len, num_heads, head_dim] (4D)
+	// and [batch, seq_len, dim] (3D)
+	var batch, seqLen, headDim, numHeads int
+	if len(shape) == 4 {
+		batch = shape[0]
+		seqLen = shape[1]
+		numHeads = shape[2]
+		headDim = shape[3]
+	} else {
+		// 3D: [batch, seq_len, dim] — treat as single head
+		batch = shape[0]
+		seqLen = shape[1]
+		numHeads = 1
+		headDim = shape[2]
+	}
+
+	if headDim%2 != 0 {
+		return fmt.Errorf("RoPE: head_dim must be even, got %d", headDim)
+	}
+	halfDim := headDim / 2
+
+	switch op.dtype {
+	case Int8:
+		return op.executeInt8(in, out, batch, seqLen, numHeads, headDim, halfDim)
+	case Float16:
+		return op.executeFP16(in, out, batch, seqLen, numHeads, headDim, halfDim)
+	default:
+		return op.executeFP32(in, out, batch, seqLen, numHeads, headDim, halfDim)
+	}
+}
+
+func (op *ropeOp) executeFP32(in, out *Tensor, batch, seqLen, numHeads, headDim, halfDim int) error {
+	inData := in.EnsureFloat32()
+	outData := out.Float32s()
+
+	baseFreq := float64(op.baseFreq)
+	headStride := headDim
+	seqStride := numHeads * headStride
+
+	for b := 0; b < batch; b++ {
+		batchOff := b * seqLen * seqStride
+		for s := 0; s < seqLen; s++ {
+			seqOff := batchOff + s*seqStride
+			pos := float64(s)
+			for h := 0; h < numHeads; h++ {
+				off := seqOff + h*headStride
+				for d := 0; d < halfDim; d++ {
+					freq := 1.0 / math.Pow(baseFreq, float64(2*d)/float64(headDim))
+					angle := pos * freq
+					cos := float32(math.Cos(angle))
+					sin := float32(math.Sin(angle))
+
+					x0 := inData[off+d]
+					x1 := inData[off+d+halfDim]
+					outData[off+d] = x0*cos - x1*sin
+					outData[off+d+halfDim] = x0*sin + x1*cos
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (op *ropeOp) executeFP16(in, out *Tensor, batch, seqLen, numHeads, headDim, halfDim int) error {
+	// FP16: dequantize to FP32, apply RoPE, quantize back to FP16
+	inData := in.EnsureFloat32()
+	outF32 := out.EnsureFloat32()
+
+	baseFreq := float64(op.baseFreq)
+	headStride := headDim
+	seqStride := numHeads * headStride
+
+	for b := 0; b < batch; b++ {
+		batchOff := b * seqLen * seqStride
+		for s := 0; s < seqLen; s++ {
+			seqOff := batchOff + s*seqStride
+			pos := float64(s)
+			for h := 0; h < numHeads; h++ {
+				off := seqOff + h*headStride
+				for d := 0; d < halfDim; d++ {
+					freq := 1.0 / math.Pow(baseFreq, float64(2*d)/float64(headDim))
+					angle := pos * freq
+					cos := float32(math.Cos(angle))
+					sin := float32(math.Sin(angle))
+
+					x0 := inData[off+d]
+					x1 := inData[off+d+halfDim]
+					outF32[off+d] = x0*cos - x1*sin
+					outF32[off+d+halfDim] = x0*sin + x1*cos
+				}
+			}
+		}
+	}
+
+	// Write back to FP16 output
+	if out.dtype == Float16 {
+		outFP16 := out.Float16s()
+		for i, v := range outF32 {
+			outFP16[i] = F32ToF16Bits(v)
+		}
+	}
+	return nil
+}
+
+func (op *ropeOp) executeInt8(in, out *Tensor, batch, seqLen, numHeads, headDim, halfDim int) error {
+	// INT8: dequantize to FP32, apply RoPE, requantize back to INT8
+	inData := in.EnsureFloat32()
+	outData := out.Float32s()
+
+	baseFreq := float64(op.baseFreq)
+	headStride := headDim
+	seqStride := numHeads * headStride
+
+	for b := 0; b < batch; b++ {
+		batchOff := b * seqLen * seqStride
+		for s := 0; s < seqLen; s++ {
+			seqOff := batchOff + s*seqStride
+			pos := float64(s)
+			for h := 0; h < numHeads; h++ {
+				off := seqOff + h*headStride
+				for d := 0; d < halfDim; d++ {
+					freq := 1.0 / math.Pow(baseFreq, float64(2*d)/float64(headDim))
+					angle := pos * freq
+					cos := float32(math.Cos(angle))
+					sin := float32(math.Sin(angle))
+
+					x0 := inData[off+d]
+					x1 := inData[off+d+halfDim]
+					outData[off+d] = x0*cos - x1*sin
+					outData[off+d+halfDim] = x0*sin + x1*cos
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (op *ropeOp) OutputShape(in []Shape) ([]Shape, error) {
+	return inferOpOutputShapes(OpRoPE, in, nil)
 }
