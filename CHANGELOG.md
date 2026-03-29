@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.0](https://github.com/GoMemPipe/mempipe/compare/v1.3.0...v1.4.0) (2026-03-29)
+
+
+### Features
+
+* Add DType-aware infrastructure and per-tensor quantization support ([cabc421](https://github.com/GoMemPipe/mempipe/commit/cabc421fe39bdbf9865bc8242235539c70fbbe8c))
+* remove mempipe package and its versioning ([e9f3e04](https://github.com/GoMemPipe/mempipe/commit/e9f3e0455432436c8467071391fcc8a55dae49d7))
+
 ## [1.3.0](https://github.com/GoMemPipe/mempipe/compare/v1.2.0...v1.3.0) (2026-03-28)
 
 
