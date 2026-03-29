@@ -28,6 +28,7 @@ type Engine struct {
 	inputs      []*Tensor          // model input tensors (ordered)
 	outputs     []*Tensor          // model output tensors (ordered)
 	weightNames map[string]bool    // pre-computed set of weight tensor names
+	overrides   *EngineOverrides   // per-engine operator overrides (nil = use global)
 }
 
 // EngineOption configures Engine construction.
@@ -45,6 +46,17 @@ func WithExtraArena(bytes int) EngineOption {
 // NewEngine creates an inference engine from a model.
 // It allocates all memory up front and compiles the execution graph.
 func NewEngine(model *Model, opts ...EngineOption) (*Engine, error) {
+	return newEngine(model, nil, opts...)
+}
+
+// NewEngineWithOverrides creates an inference engine with per-engine operator
+// overrides. This avoids mutating the global operator registry. Overrides
+// take precedence over the global registry for the lifetime of this engine.
+func NewEngineWithOverrides(model *Model, overrides *EngineOverrides, opts ...EngineOption) (*Engine, error) {
+	return newEngine(model, overrides, opts...)
+}
+
+func newEngine(model *Model, overrides *EngineOverrides, opts ...EngineOption) (*Engine, error) {
 	if model == nil {
 		return nil, errors.New("model is nil")
 	}
@@ -58,8 +70,9 @@ func NewEngine(model *Model, opts ...EngineOption) (*Engine, error) {
 	}
 
 	e := &Engine{
-		model:   model,
-		tensors: make(map[string]*Tensor, len(model.TensorNames)),
+		model:     model,
+		tensors:   make(map[string]*Tensor, len(model.TensorNames)),
+		overrides: overrides,
 	}
 
 	if err := e.compile(cfg); err != nil {
@@ -124,6 +137,7 @@ func (e *Engine) compile(cfg engineConfig) error {
 
 	// 3. Compute total arena size
 	//    = weights (64B aligned) + all non-weight tensors (64B aligned each)
+	//    + scratch buffers for non-Float32 weight tensors (for EnsureFloat32)
 	arenaSize := int(align64(uint64(len(model.WeightsBlob))))
 
 	// Store the weight set on the engine for ReshapeInputs.
@@ -140,6 +154,19 @@ func (e *Engine) compile(cfg engineConfig) error {
 		byteSize := s.NumElements() * Float32.Size()
 		arenaSize += int(align64(uint64(byteSize)))
 	}
+
+	// Reserve scratch space for non-Float32 weight dequantization
+	if weightDType != Float32 {
+		for name := range isWeight {
+			s, ok := allShapes[name]
+			if !ok {
+				continue
+			}
+			scratchSize := s.NumElements() * Float32.Size()
+			arenaSize += int(align64(uint64(scratchSize)))
+		}
+	}
+
 	arenaSize += cfg.extraArenaBytes
 
 	// 4. Allocate single arena
@@ -187,6 +214,39 @@ func (e *Engine) compile(cfg engineConfig) error {
 		}
 	}
 
+	// 6a. Set per-tensor quantization params and allocate scratch buffers
+	//     for non-Float32 weight tensors so EnsureFloat32() works on the hot path.
+	for name, t := range e.tensors {
+		if t.dtype == Float32 {
+			continue
+		}
+		// Set quantization parameters: per-tensor first, global fallback
+		if model.Metadata.TensorScales != nil {
+			if s, ok := model.Metadata.TensorScales[name]; ok {
+				t.quantScale = s
+			}
+		}
+		if t.quantScale == 0 {
+			t.quantScale = model.Metadata.QuantScale
+		}
+		if model.Metadata.TensorZeros != nil {
+			if z, ok := model.Metadata.TensorZeros[name]; ok {
+				t.quantZero = z
+			}
+		}
+		if t.quantZero == 0 {
+			t.quantZero = model.Metadata.QuantZero
+		}
+		// Allocate scratch buffer and pre-populate with dequantized data
+		scratchSize := t.NumElements() * Float32.Size()
+		scratch, err := e.arena.AllocRaw(scratchSize)
+		if err != nil {
+			return fmt.Errorf("alloc scratch for %q: %w", name, err)
+		}
+		t.SetScratch(scratch)
+		t.PopulateScratchFloat32()
+	}
+
 	// 6. Record input/output tensors
 	e.inputs = make([]*Tensor, len(model.Metadata.InputShapes))
 	for i := range model.Metadata.InputShapes {
@@ -214,12 +274,14 @@ func (e *Engine) compile(cfg engineConfig) error {
 	// 7. Compile operators in graph order (already topological)
 	e.opOrder = make([]compiledOp, len(model.Graph))
 	for i, node := range model.Graph {
-		op, err := GetOperator(node.Type)
+		op, err := getOperatorWithOverrides(node.Type, e.overrides)
 		if err != nil {
 			return fmt.Errorf("node %d: %w", i, err)
 		}
 
 		ins := make([]*Tensor, len(node.InputIndices))
+		inNames := make([]string, len(node.InputIndices))
+		inDTypes := make([]DType, len(node.InputIndices))
 		for j, idx := range node.InputIndices {
 			name := model.TensorNames[idx]
 			t, ok := e.tensors[name]
@@ -227,9 +289,13 @@ func (e *Engine) compile(cfg engineConfig) error {
 				return fmt.Errorf("node %d input tensor %q not found", i, name)
 			}
 			ins[j] = t
+			inNames[j] = name
+			inDTypes[j] = t.dtype
 		}
 
 		outs := make([]*Tensor, len(node.OutputIndices))
+		outNames := make([]string, len(node.OutputIndices))
+		outDTypes := make([]DType, len(node.OutputIndices))
 		for j, idx := range node.OutputIndices {
 			name := model.TensorNames[idx]
 			t, ok := e.tensors[name]
@@ -237,6 +303,8 @@ func (e *Engine) compile(cfg engineConfig) error {
 				return fmt.Errorf("node %d output tensor %q not found", i, name)
 			}
 			outs[j] = t
+			outNames[j] = name
+			outDTypes[j] = t.dtype
 		}
 
 		e.opOrder[i] = compiledOp{op: op, inputs: ins, outputs: outs}
@@ -245,6 +313,25 @@ func (e *Engine) compile(cfg engineConfig) error {
 		if attr, ok := op.(Attributable); ok && len(node.Attrs) > 0 {
 			if err := attr.SetAttrs(node.Attrs); err != nil {
 				return fmt.Errorf("node %d set attrs: %w", i, err)
+			}
+		}
+
+		// DType negotiation: if the operator implements DTypeAware,
+		// provide dtype and quantization metadata so it can select
+		// optimized execution paths (e.g. SIMD INT8 matmul).
+		if dtAware, ok := op.(DTypeAware); ok {
+			info := &DTypeInfo{
+				InputDTypes:  inDTypes,
+				OutputDTypes: outDTypes,
+				InputNames:   inNames,
+				OutputNames:  outNames,
+				TensorScales: model.Metadata.TensorScales,
+				TensorZeros:  model.Metadata.TensorZeros,
+				GlobalScale:  model.Metadata.QuantScale,
+				GlobalZero:   model.Metadata.QuantZero,
+			}
+			if err := dtAware.SetDTypeInfo(info); err != nil {
+				return fmt.Errorf("node %d set dtype info: %w", i, err)
 			}
 		}
 

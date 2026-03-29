@@ -61,12 +61,15 @@ func (d DType) String() string {
 // Tensors never own memory — they are always views into an InferenceArena.
 // All hot-path methods are zero-allocation.
 type Tensor struct {
-	data    unsafe.Pointer // pointer to first element in arena
-	shape   []int          // dimensions (e.g. [batch, rows, cols])
-	strides []int          // byte strides per dimension
-	dtype   DType          // element data type
-	name    string         // tensor name (for debugging)
-	size    int            // total byte size of data
+	data       unsafe.Pointer // pointer to first element in arena
+	shape      []int          // dimensions (e.g. [batch, rows, cols])
+	strides    []int          // byte strides per dimension
+	dtype      DType          // element data type
+	name       string         // tensor name (for debugging)
+	size       int            // total byte size of data
+	scratch    unsafe.Pointer // pre-allocated Float32 scratch for dequantization
+	quantScale float32        // per-tensor quantization scale (0 = use default)
+	quantZero  int32          // per-tensor quantization zero-point
 }
 
 // Name returns the tensor's name.
@@ -221,6 +224,80 @@ func (t *Tensor) Float32s() []float32 {
 	n := t.NumElements()
 	return unsafe.Slice((*float32)(t.data), n)
 }
+
+// EnsureFloat32 returns the tensor's data as float32, performing on-the-fly
+// dequantization for non-Float32 dtypes using the pre-allocated scratch buffer.
+// For Float32 tensors this is zero-cost (returns Float32s directly).
+// For Int8/FP16 tensors, the scratch buffer must have been allocated at
+// compile time via SetScratch.
+//
+//mem:hot
+func (t *Tensor) EnsureFloat32() []float32 {
+	if t.dtype == Float32 {
+		return t.Float32s()
+	}
+	if t.scratch == nil {
+		// Fallback: should not happen in a properly compiled engine.
+		return t.Float32s()
+	}
+	n := t.NumElements()
+	return unsafe.Slice((*float32)(t.scratch), n)
+}
+
+// PopulateScratchFloat32 dequantizes the tensor data into the scratch buffer.
+// Called once at compile time for weight tensors. Zero-alloc on the hot path
+// since the scratch is reused across inference calls.
+func (t *Tensor) PopulateScratchFloat32() {
+	if t.dtype == Float32 || t.scratch == nil {
+		return
+	}
+	n := t.NumElements()
+	dst := unsafe.Slice((*float32)(t.scratch), n)
+	switch t.dtype {
+	case Int8:
+		src := t.Int8s()
+		scale := t.quantScale
+		zero := t.quantZero
+		if scale == 0 {
+			scale = 1.0 / 127.0
+		}
+		for i, v := range src {
+			dst[i] = float32(int32(v)-zero) * scale
+		}
+	case Uint8:
+		src := unsafe.Slice((*uint8)(t.data), n)
+		scale := t.quantScale
+		zero := t.quantZero
+		if scale == 0 {
+			scale = 1.0 / 255.0
+		}
+		for i, v := range src {
+			dst[i] = float32(int32(v)-zero) * scale
+		}
+	case Float16:
+		src := t.Float16s()
+		for i, v := range src {
+			dst[i] = F16BitsToF32(v)
+		}
+	}
+}
+
+// SetScratch installs a pre-allocated scratch buffer for dequantization.
+func (t *Tensor) SetScratch(ptr unsafe.Pointer) {
+	t.scratch = ptr
+}
+
+// SetQuantParams sets per-tensor quantization scale and zero-point.
+func (t *Tensor) SetQuantParams(scale float32, zero int32) {
+	t.quantScale = scale
+	t.quantZero = zero
+}
+
+// QuantScale returns the per-tensor quantization scale.
+func (t *Tensor) QuantScale() float32 { return t.quantScale }
+
+// QuantZero returns the per-tensor quantization zero-point.
+func (t *Tensor) QuantZero() int32 { return t.quantZero }
 
 // Int8s returns the tensor's data as an int8 slice (view into arena).
 //

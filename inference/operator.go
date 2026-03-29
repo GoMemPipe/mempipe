@@ -35,6 +35,27 @@ type Attributable interface {
 	SetAttrs(attrs []byte) error
 }
 
+// DTypeAware is an optional interface for operators that need to know input
+// tensor data types at compile time. This allows operators to query input
+// dtypes, access per-tensor quantization metadata, and select optimized
+// execution paths (e.g. SIMD INT8 matmul vs Float32 matmul).
+type DTypeAware interface {
+	SetDTypeInfo(info *DTypeInfo) error
+}
+
+// DTypeInfo carries dtype and quantization metadata to DTypeAware operators
+// during Engine.compile().
+type DTypeInfo struct {
+	InputDTypes  []DType            // dtype of each input tensor
+	OutputDTypes []DType            // dtype of each output tensor
+	InputNames   []string           // name of each input tensor
+	OutputNames  []string           // name of each output tensor
+	TensorScales map[string]float32 // per-tensor scales from model metadata
+	TensorZeros  map[string]int32   // per-tensor zeros from model metadata
+	GlobalScale  float32            // fallback global scale
+	GlobalZero   int32              // fallback global zero
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Operator Registry
 // ────────────────────────────────────────────────────────────────────────────
@@ -60,6 +81,54 @@ func GetOperator(opType OpType) (Operator, error) {
 		return nil, fmt.Errorf("no operator registered for %s", opType)
 	}
 	return factory(), nil
+}
+
+// RegistrySnapshot is an opaque snapshot of the operator registry.
+type RegistrySnapshot struct {
+	factories map[OpType]func() Operator
+}
+
+// SnapshotRegistry returns a snapshot of the current operator registry.
+// Use with RestoreRegistry to safely mutate and restore global state.
+func SnapshotRegistry() *RegistrySnapshot {
+	operatorsMu.RLock()
+	defer operatorsMu.RUnlock()
+	snap := &RegistrySnapshot{
+		factories: make(map[OpType]func() Operator, len(operators)),
+	}
+	for k, v := range operators {
+		snap.factories[k] = v
+	}
+	return snap
+}
+
+// RestoreRegistry restores the operator registry from a previous snapshot.
+func RestoreRegistry(snap *RegistrySnapshot) {
+	if snap == nil {
+		return
+	}
+	operatorsMu.Lock()
+	defer operatorsMu.Unlock()
+	operators = make(map[OpType]func() Operator, len(snap.factories))
+	for k, v := range snap.factories {
+		operators[k] = v
+	}
+}
+
+// EngineOverrides provides per-engine operator overrides without mutating
+// the global registry.
+type EngineOverrides struct {
+	Operators map[OpType]func() Operator
+}
+
+// getOperatorWithOverrides resolves an operator, checking overrides first.
+func getOperatorWithOverrides(opType OpType, overrides *EngineOverrides) (Operator, error) {
+	if overrides != nil {
+		if factory, ok := overrides.Operators[opType]; ok {
+			return factory(), nil
+		}
+	}
+	return GetOperator(opType)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -123,8 +192,8 @@ func (op *matMulOp) Init(arena *InferenceArena) error {
 
 func (op *matMulOp) Execute(inputs, outputs []*Tensor) error {
 	a, b, c := inputs[0], inputs[1], outputs[0]
-	aData := a.Float32s()
-	bData := b.Float32s()
+	aData := a.EnsureFloat32()
+	bData := b.EnsureFloat32()
 	cData := c.Float32s()
 
 	m := a.shape[len(a.shape)-2]
@@ -153,8 +222,8 @@ type denseOp struct{}
 func (denseOp) Execute(inputs, outputs []*Tensor) error {
 	// inputs[0] = A [m, k], inputs[1] = W [k, n], inputs[2] = bias [n] (optional)
 	a, w, c := inputs[0], inputs[1], outputs[0]
-	aData := a.Float32s()
-	wData := w.Float32s()
+	aData := a.EnsureFloat32()
+	wData := w.EnsureFloat32()
 	cData := c.Float32s()
 
 	m := a.shape[len(a.shape)-2]
@@ -165,7 +234,7 @@ func (denseOp) Execute(inputs, outputs []*Tensor) error {
 
 	// Add bias if present
 	if len(inputs) > 2 {
-		bias := inputs[2].Float32s()
+		bias := inputs[2].EnsureFloat32()
 		for i := 0; i < m; i++ {
 			row := cData[i*n : i*n+n]
 			for j := 0; j < n; j++ {
@@ -188,8 +257,8 @@ type addOp struct{}
 
 func (addOp) Execute(inputs, outputs []*Tensor) error {
 	a, b, c := inputs[0], inputs[1], outputs[0]
-	aData := a.Float32s()
-	bData := b.Float32s()
+	aData := a.EnsureFloat32()
+	bData := b.EnsureFloat32()
 	cData := c.Float32s()
 
 	na := len(aData)
@@ -237,7 +306,7 @@ func (addOp) OutputShape(in []Shape) ([]Shape, error) {
 type reluOp struct{}
 
 func (reluOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	for i, v := range src {
 		if v < 0 {
@@ -260,7 +329,7 @@ func (reluOp) OutputShape(in []Shape) ([]Shape, error) {
 type sigmoidOp struct{}
 
 func (sigmoidOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	for i, v := range src {
 		dst[i] = float32(1.0 / (1.0 + math.Exp(-float64(v))))
@@ -279,7 +348,7 @@ func (sigmoidOp) OutputShape(in []Shape) ([]Shape, error) {
 type softmaxOp struct{}
 
 func (softmaxOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	shape := inputs[0].shape
 
@@ -450,8 +519,8 @@ func (op *conv2dOp) Execute(inputs, outputs []*Tensor) error {
 	kernel := inputs[1] // [OutC, InC/groups, KH, KW]
 	output := outputs[0]
 
-	inData := input.Float32s()
-	kData := kernel.Float32s()
+	inData := input.EnsureFloat32()
+	kData := kernel.EnsureFloat32()
 	outData := output.Float32s()
 
 	n := input.shape[0]
@@ -616,7 +685,7 @@ func (op *conv2dOp) Execute(inputs, outputs []*Tensor) error {
 
 	// Add bias if present
 	if len(inputs) > 2 {
-		bias := inputs[2].Float32s()
+		bias := inputs[2].EnsureFloat32()
 		for batch := 0; batch < n; batch++ {
 			for oc := 0; oc < outC; oc++ {
 				bv := bias[oc]
@@ -643,7 +712,7 @@ type maxPool2dOp struct{}
 func (maxPool2dOp) Execute(inputs, outputs []*Tensor) error {
 	in := inputs[0]
 	out := outputs[0]
-	inData := in.Float32s()
+	inData := in.EnsureFloat32()
 	outData := out.Float32s()
 
 	n := in.shape[0]
@@ -690,7 +759,7 @@ type avgPool2dOp struct{}
 func (avgPool2dOp) Execute(inputs, outputs []*Tensor) error {
 	in := inputs[0]
 	out := outputs[0]
-	inData := in.Float32s()
+	inData := in.EnsureFloat32()
 	outData := out.Float32s()
 
 	n := in.shape[0]
@@ -733,12 +802,12 @@ type batchNormOp struct{}
 
 func (batchNormOp) Execute(inputs, outputs []*Tensor) error {
 	x := inputs[0]
-	gamma := inputs[1].Float32s()
-	beta := inputs[2].Float32s()
-	runMean := inputs[3].Float32s()
-	runVar := inputs[4].Float32s()
+	gamma := inputs[1].EnsureFloat32()
+	beta := inputs[2].EnsureFloat32()
+	runMean := inputs[3].EnsureFloat32()
+	runVar := inputs[4].EnsureFloat32()
 
-	xData := x.Float32s()
+	xData := x.EnsureFloat32()
 	yData := outputs[0].Float32s()
 
 	const eps = 1e-5
@@ -785,7 +854,7 @@ type flattenOp struct{}
 func (flattenOp) Execute(inputs, outputs []*Tensor) error {
 	// Flatten is a view operation. Since input and output share arena memory
 	// (wired by engine), we just copy if they differ.
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	if &src[0] != &dst[0] {
 		copy(dst, src)
@@ -804,7 +873,7 @@ func (flattenOp) OutputShape(in []Shape) ([]Shape, error) {
 type reshapeOp struct{}
 
 func (reshapeOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	if &src[0] != &dst[0] {
 		copy(dst, src)
@@ -865,16 +934,68 @@ func (quantizeOp) OutputShape(in []Shape) ([]Shape, error) {
 // Dequantize: int8 → float32
 // ════════════════════════════════════════════════════════════════════════════
 
-type dequantizeOp struct{}
+type dequantizeOp struct {
+	scale float32
+	zero  int32
+}
 
-func (dequantizeOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Int8s()
-	dst := outputs[0].Float32s()
+func (op *dequantizeOp) SetDTypeInfo(info *DTypeInfo) error {
+	// Prefer per-tensor scale for the input tensor
+	if len(info.InputNames) > 0 {
+		name := info.InputNames[0]
+		if s, ok := info.TensorScales[name]; ok {
+			op.scale = s
+		} else if info.GlobalScale != 0 {
+			op.scale = info.GlobalScale
+		}
+		if z, ok := info.TensorZeros[name]; ok {
+			op.zero = z
+		} else {
+			op.zero = info.GlobalZero
+		}
+	}
+	if op.scale == 0 {
+		op.scale = 1.0 / 127.0 // safe fallback
+	}
+	return nil
+}
 
-	// Default scale = 1/127 if no attrs; real scale would come from model metadata
-	var scale float32 = 1.0 / 127.0
-	for i, v := range src {
-		dst[i] = float32(v) * scale
+func (op *dequantizeOp) Execute(inputs, outputs []*Tensor) error {
+	src := inputs[0]
+	dst := outputs[0]
+	dstData := dst.Float32s()
+
+	// Use per-tensor params from the input tensor, falling back to op-level params
+	scale := src.quantScale
+	zero := src.quantZero
+	if scale == 0 {
+		scale = op.scale
+	}
+	if scale == 0 {
+		scale = 1.0 / 127.0
+	}
+
+	switch src.dtype {
+	case Int8:
+		srcData := src.Int8s()
+		for i, v := range srcData {
+			dstData[i] = float32(int32(v)-zero) * scale
+		}
+	case Uint8:
+		n := src.NumElements()
+		srcData := unsafe.Slice((*uint8)(src.data), n)
+		for i, v := range srcData {
+			dstData[i] = float32(int32(v)-zero) * scale
+		}
+	case Float16:
+		srcData := src.Float16s()
+		for i, v := range srcData {
+			dstData[i] = F16BitsToF32(v)
+		}
+	default:
+		// Already float32 or unknown — just copy
+		srcData := src.EnsureFloat32()
+		copy(dstData, srcData)
 	}
 	return nil
 }
@@ -925,7 +1046,7 @@ var sqrt2OverPi = float32(math.Sqrt(2.0 / math.Pi))
 type geluOp struct{}
 
 func (geluOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	for i, x := range src {
 		x3 := x * x * x
@@ -948,10 +1069,10 @@ type layerNormOp struct{}
 
 func (layerNormOp) Execute(inputs, outputs []*Tensor) error {
 	x := inputs[0]
-	gamma := inputs[1].Float32s()
-	beta := inputs[2].Float32s()
+	gamma := inputs[1].EnsureFloat32()
+	beta := inputs[2].EnsureFloat32()
 
-	xData := x.Float32s()
+	xData := x.EnsureFloat32()
 	yData := outputs[0].Float32s()
 
 	const eps = 1e-5
@@ -1007,7 +1128,7 @@ func (layerNormOp) OutputShape(in []Shape) ([]Shape, error) {
 type gatherOp struct{}
 
 func (gatherOp) Execute(inputs, outputs []*Tensor) error {
-	weightData := inputs[0].Float32s()
+	weightData := inputs[0].EnsureFloat32()
 	indices := inputs[1].Int32s()
 	outData := outputs[0].Float32s()
 
@@ -1033,8 +1154,8 @@ type batchedMatMulOp struct{}
 
 func (batchedMatMulOp) Execute(inputs, outputs []*Tensor) error {
 	a, b, c := inputs[0], inputs[1], outputs[0]
-	aData := a.Float32s()
-	bData := b.Float32s()
+	aData := a.EnsureFloat32()
+	bData := b.EnsureFloat32()
 	cData := c.Float32s()
 
 	rank := len(a.shape)
@@ -1075,8 +1196,8 @@ type mulOp struct{}
 
 func (mulOp) Execute(inputs, outputs []*Tensor) error {
 	a, b, c := inputs[0], inputs[1], outputs[0]
-	aData := a.Float32s()
-	bData := b.Float32s()
+	aData := a.EnsureFloat32()
+	bData := b.EnsureFloat32()
 	cData := c.Float32s()
 
 	na := len(aData)
@@ -1125,8 +1246,8 @@ type subOp struct{}
 
 func (subOp) Execute(inputs, outputs []*Tensor) error {
 	a, b, c := inputs[0], inputs[1], outputs[0]
-	aData := a.Float32s()
-	bData := b.Float32s()
+	aData := a.EnsureFloat32()
+	bData := b.EnsureFloat32()
 	cData := c.Float32s()
 
 	na := len(aData)
@@ -1195,7 +1316,7 @@ func (op *transposeOp) SetAttrs(attrs []byte) error {
 func (op *transposeOp) Execute(inputs, outputs []*Tensor) error {
 	src := inputs[0]
 	dst := outputs[0]
-	srcData := src.Float32s()
+	srcData := src.EnsureFloat32()
 	dstData := dst.Float32s()
 
 	shape := src.shape
@@ -1263,7 +1384,7 @@ func (op *transposeOp) OutputShape(in []Shape) ([]Shape, error) {
 type tanhOp struct{}
 
 func (tanhOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	for i, v := range src {
 		dst[i] = float32(math.Tanh(float64(v)))
@@ -1285,7 +1406,7 @@ type sliceOp struct{}
 func (sliceOp) Execute(inputs, outputs []*Tensor) error {
 	src := inputs[0]
 	dst := outputs[0]
-	srcData := src.Float32s()
+	srcData := src.EnsureFloat32()
 	dstData := dst.Float32s()
 
 	srcShape := src.shape
@@ -1337,9 +1458,9 @@ func (sliceOp) OutputShape(in []Shape) ([]Shape, error) {
 type whereOp struct{}
 
 func (whereOp) Execute(inputs, outputs []*Tensor) error {
-	condData := inputs[0].Float32s()
-	aData := inputs[1].Float32s()
-	bData := inputs[2].Float32s()
+	condData := inputs[0].EnsureFloat32()
+	aData := inputs[1].EnsureFloat32()
+	bData := inputs[2].EnsureFloat32()
 	outData := outputs[0].Float32s()
 
 	n := len(outData)
@@ -1371,7 +1492,7 @@ type splitOp struct{}
 
 func (splitOp) Execute(inputs, outputs []*Tensor) error {
 	src := inputs[0]
-	srcData := src.Float32s()
+	srcData := src.EnsureFloat32()
 	srcShape := src.shape
 	ndims := len(srcShape)
 	numSplits := len(outputs)
@@ -1422,8 +1543,8 @@ type divOp struct{}
 
 func (divOp) Execute(inputs, outputs []*Tensor) error {
 	inA, inB, out := inputs[0], inputs[1], outputs[0]
-	a := inA.Float32s()
-	b := inB.Float32s()
+	a := inA.EnsureFloat32()
+	b := inB.EnsureFloat32()
 	dst := out.Float32s()
 
 	if len(a) == len(b) {
@@ -1468,8 +1589,8 @@ func (divOp) OutputShape(in []Shape) ([]Shape, error) {
 type powOp struct{}
 
 func (powOp) Execute(inputs, outputs []*Tensor) error {
-	a := inputs[0].Float32s()
-	b := inputs[1].Float32s()
+	a := inputs[0].EnsureFloat32()
+	b := inputs[1].EnsureFloat32()
 	dst := outputs[0].Float32s()
 
 	if len(b) == 1 {
@@ -1512,7 +1633,7 @@ func (powOp) OutputShape(in []Shape) ([]Shape, error) {
 type isNaNOp struct{}
 
 func (isNaNOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	for i, v := range src {
 		if v != v { // NaN != NaN
@@ -1536,8 +1657,8 @@ func (isNaNOp) OutputShape(in []Shape) ([]Shape, error) {
 type andOp struct{}
 
 func (andOp) Execute(inputs, outputs []*Tensor) error {
-	a := inputs[0].Float32s()
-	b := inputs[1].Float32s()
+	a := inputs[0].EnsureFloat32()
+	b := inputs[1].EnsureFloat32()
 	dst := outputs[0].Float32s()
 
 	na := len(a)
@@ -1567,7 +1688,7 @@ type globalAvgPool2dOp struct{}
 func (globalAvgPool2dOp) Execute(inputs, outputs []*Tensor) error {
 	in := inputs[0]
 	out := outputs[0]
-	inData := in.Float32s()
+	inData := in.EnsureFloat32()
 	outData := out.Float32s()
 
 	n := in.shape[0]
@@ -1615,7 +1736,7 @@ func (op *hardSigmoidOp) SetAttrs(attrs []byte) error {
 }
 
 func (op *hardSigmoidOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 
 	alpha := op.alpha
@@ -1651,7 +1772,7 @@ func (op *hardSigmoidOp) OutputShape(in []Shape) ([]Shape, error) {
 type hardSwishOp struct{}
 
 func (hardSwishOp) Execute(inputs, outputs []*Tensor) error {
-	src := inputs[0].Float32s()
+	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 
 	for i, v := range src {
