@@ -197,9 +197,10 @@ func (op *matMulOp) Execute(inputs, outputs []*Tensor) error {
 	bData := b.EnsureFloat32()
 	cData := c.Float32s()
 
-	m := a.shape[len(a.shape)-2]
-	k := a.shape[len(a.shape)-1]
-	n := b.shape[len(b.shape)-1]
+	m, k, n, err := matMulGEMMSizes(a.shape, b.shape)
+	if err != nil {
+		return err
+	}
 
 	matMulF32(aData, bData, cData, m, k, n)
 	return nil
@@ -227,9 +228,10 @@ func (denseOp) Execute(inputs, outputs []*Tensor) error {
 	wData := w.EnsureFloat32()
 	cData := c.Float32s()
 
-	m := a.shape[len(a.shape)-2]
-	k := a.shape[len(a.shape)-1]
-	n := w.shape[len(w.shape)-1]
+	m, k, n, err := matMulGEMMSizes(a.shape, w.shape)
+	if err != nil {
+		return err
+	}
 
 	matMulF32(aData, wData, cData, m, k, n)
 
@@ -343,32 +345,135 @@ func (sigmoidOp) OutputShape(in []Shape) ([]Shape, error) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Softmax: row-wise softmax
-// ════════════════════════════════════════════════════════════════════════════
+// softmaxStrided applies softmax to elements src[start + j*stride] for j in [0, length).
+//
+//mem:hot
+//mem:nogc
+func softmaxStrided(src, dst []float32, start, stride, length int) {
+	if length <= 0 {
+		return
+	}
+	maxVal := src[start]
+	for j := 1; j < length; j++ {
+		v := src[start+j*stride]
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	var sum float32
+	for j := 0; j < length; j++ {
+		idx := start + j*stride
+		e := float32(math.Exp(float64(src[idx] - maxVal)))
+		dst[idx] = e
+		sum += e
+	}
+	invSum := float32(1.0 / float64(sum))
+	for j := 0; j < length; j++ {
+		idx := start + j*stride
+		dst[idx] *= invSum
+	}
+}
 
-type softmaxOp struct{}
+// softmaxAlongAxis softmaxes along one axis for rank ≤ 8 tensors (row-major).
+//
+//mem:hot
+//mem:nogc
+func softmaxAlongAxis(src, dst []float32, shape []int, axis int) {
+	rank := len(shape)
+	if rank == 0 {
+		return
+	}
+	if axis < 0 {
+		axis += rank
+	}
+	if axis < 0 || axis >= rank {
+		axis = rank - 1
+	}
+	var strides [8]int
+	strides[rank-1] = 1
+	for i := rank - 2; i >= 0; i-- {
+		strides[i] = strides[i+1] * shape[i+1]
+	}
+	ss := strides[axis]
+	sl := shape[axis]
 
-func (softmaxOp) Execute(inputs, outputs []*Tensor) error {
+	fiberCount := 1
+	for i := 0; i < rank; i++ {
+		if i != axis {
+			fiberCount *= shape[i]
+		}
+	}
+
+	for f := 0; f < fiberCount; f++ {
+		rem := f
+		base := 0
+		for i := rank - 1; i >= 0; i-- {
+			if i == axis {
+				continue
+			}
+			c := rem % shape[i]
+			rem /= shape[i]
+			base += c * strides[i]
+		}
+		softmaxStrided(src, dst, base, ss, sl)
+	}
+}
+
+// Softmax: softmax along an optional axis (encoded attrs: int16 axis, ONNX semantics).
+type softmaxOp struct {
+	axisSet bool
+	axis    int // raw ONNX axis (may be negative)
+}
+
+func (op *softmaxOp) SetAttrs(attrs []byte) error {
+	op.axisSet = false
+	op.axis = -1
+	if len(attrs) >= 2 {
+		op.axisSet = true
+		op.axis = int(int16(binary.LittleEndian.Uint16(attrs[0:2])))
+	}
+	return nil
+}
+
+func (op *softmaxOp) Execute(inputs, outputs []*Tensor) error {
 	src := inputs[0].EnsureFloat32()
 	dst := outputs[0].Float32s()
 	shape := inputs[0].shape
 
-	if len(shape) < 2 {
-		// 1D softmax
+	rank := len(shape)
+	if rank == 0 {
+		return nil
+	}
+	if rank == 1 {
 		softmaxRow(src, dst)
 		return nil
 	}
 
-	rows := 1
-	for i := 0; i < len(shape)-1; i++ {
-		rows *= shape[i]
+	axis := rank - 1
+	if op.axisSet {
+		axis = op.axis
+		if axis < 0 {
+			axis += rank
+		}
+		if axis < 0 || axis >= rank {
+			axis = rank - 1
+		}
 	}
-	cols := shape[len(shape)-1]
 
-	for r := 0; r < rows; r++ {
-		start := r * cols
-		softmaxRow(src[start:start+cols], dst[start:start+cols])
+	if axis == rank-1 {
+		rows := 1
+		for i := 0; i < rank-1; i++ {
+			rows *= shape[i]
+		}
+		cols := shape[rank-1]
+		for r := 0; r < rows; r++ {
+			start := r * cols
+			softmaxRow(src[start:start+cols], dst[start:start+cols])
+		}
+		return nil
 	}
+
+	softmaxAlongAxis(src, dst, shape, axis)
 	return nil
 }
 
@@ -1367,7 +1472,11 @@ func (op *transposeOp) Execute(inputs, outputs []*Tensor) error {
 		// Compute source linear index
 		srcIdx := 0
 		for d := 0; d < ndims; d++ {
-			srcIdx += coords[d] * srcStrides[perm[d]]
+			pd := perm[d]
+			if pd < 0 || pd >= ndims {
+				pd = d
+			}
+			srcIdx += coords[d] * srcStrides[pd]
 		}
 		dstData[idx] = srcData[srcIdx]
 	}

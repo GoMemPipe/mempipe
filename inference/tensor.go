@@ -683,16 +683,206 @@ const maxInt = int(^uint(0) >> 1)
 // Shape inference — compute intermediate tensor shapes from graph
 // ────────────────────────────────────────────────────────────────────────────
 
+// InferShapeOptions configures optional shape inference behavior.
+type InferShapeOptions struct {
+	// ReshapeShapeHints maps tensor name → target shape dimensions for Reshape
+	// nodes whose target shape is carried on a constant tensor input instead of attrs.
+	ReshapeShapeHints map[string][]int
+}
+
+type reshapeExtra struct {
+	TensorNames  []string
+	InputIndices []int
+	Hints        map[string][]int
+}
+
+func (rx *reshapeExtra) reshapeHint() []int {
+	if rx == nil || rx.Hints == nil || len(rx.InputIndices) < 2 {
+		return nil
+	}
+	ii := rx.InputIndices[1]
+	if ii < 0 || ii >= len(rx.TensorNames) {
+		return nil
+	}
+	return rx.Hints[rx.TensorNames[ii]]
+}
+
+// broadcastLeadingDimsMatMul applies NumPy/ONNX-style right-aligned batch broadcasting
+// for the prefix dimensions of MatMul inputs (all dims except the last two).
+func broadcastLeadingDimsMatMul(a, b []int) ([]int, error) {
+	la, lb := len(a), len(b)
+	outLen := la
+	if lb > outLen {
+		outLen = lb
+	}
+	out := make([]int, outLen)
+	for i := 0; i < outLen; i++ {
+		da, db := 1, 1
+		if i < la {
+			da = a[la-1-i]
+		}
+		if i < lb {
+			db = b[lb-1-i]
+		}
+		switch {
+		case da == db:
+			out[outLen-1-i] = da
+		case da == 1:
+			out[outLen-1-i] = db
+		case db == 1:
+			out[outLen-1-i] = da
+		default:
+			return nil, fmt.Errorf("matmul batch broadcast mismatch %d vs %d", da, db)
+		}
+	}
+	return out, nil
+}
+
+func inferMatMulOutputDims(a, b []int) ([]int, error) {
+	if len(a) < 2 || len(b) < 2 {
+		return nil, errors.New("MatMul inputs must be at least 2D")
+	}
+	kA := a[len(a)-1]
+	kB := b[len(b)-2]
+	if kA != kB && kA != 1 && kB != 1 {
+		return nil, fmt.Errorf("MatMul inner dimension mismatch %d vs %d", kA, kB)
+	}
+	preA := a[:len(a)-2]
+	preB := b[:len(b)-2]
+	prefix, err := broadcastLeadingDimsMatMul(preA, preB)
+	if err != nil {
+		return nil, err
+	}
+	m := a[len(a)-2]
+	n := b[len(b)-1]
+	out := make([]int, len(prefix)+2)
+	copy(out, prefix)
+	out[len(out)-2] = m
+	out[len(out)-1] = n
+	return out, nil
+}
+
+// matMulGEMMSizes returns (m, k, n) for a single GEMM covering the stacked batch
+// dimensions of MatMul/Dense, matching inferMatMulOutputDims.
+func matMulGEMMSizes(aShape, bShape []int) (m, k, n int, err error) {
+	out, err := inferMatMulOutputDims(aShape, bShape)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	n = out[len(out)-1]
+	m = 1
+	for i := 0; i < len(out)-1; i++ {
+		m *= out[i]
+	}
+	k = aShape[len(aShape)-1]
+	return m, k, n, nil
+}
+
+func parseReshapeTargetDims(attrs []byte, hint []int) ([]int, error) {
+	if len(attrs) >= 2 {
+		ndims := int(binary.LittleEndian.Uint16(attrs[0:2]))
+		if ndims < 0 || ndims > 64 {
+			return nil, errors.New("reshape: invalid ndims")
+		}
+		need := 2 + ndims*4
+		if len(attrs) >= need {
+			dims := make([]int, ndims)
+			for i := range dims {
+				off := 2 + i*4
+				if off+4 > len(attrs) {
+					return nil, errors.New("reshape attrs truncated")
+				}
+				dims[i] = int(int32(binary.LittleEndian.Uint32(attrs[off:])))
+			}
+			return dims, nil
+		}
+	}
+	if len(hint) > 0 {
+		dims := make([]int, len(hint))
+		copy(dims, hint)
+		return dims, nil
+	}
+	return nil, errors.New("reshape: missing target shape (attrs or shape-input hints)")
+}
+
+func inferReshapeOutput(in Shape, attrs []byte, hint []int) ([]Shape, error) {
+	dims, err := parseReshapeTargetDims(attrs, hint)
+	if err != nil {
+		return nil, err
+	}
+
+	inDims := in.Dims
+	inputElems := in.NumElements()
+	neg1Idx := -1
+	known := 1
+	for i, d := range dims {
+		switch {
+		case d == -1:
+			neg1Idx = i
+		case d == 0:
+			if i >= len(inDims) {
+				return nil, fmt.Errorf("reshape: dimension %d uses copy-from-input but input rank is %d", i, len(inDims))
+			}
+			dims[i] = inDims[i]
+			known *= dims[i]
+		default:
+			if d < 0 {
+				return nil, fmt.Errorf("reshape: invalid dimension %d", d)
+			}
+			known *= d
+		}
+	}
+	if neg1Idx >= 0 && known > 0 && inputElems%known == 0 {
+		dims[neg1Idx] = inputElems / known
+	} else if neg1Idx >= 0 {
+		return nil, errors.New("reshape: cannot infer -1 dimension")
+	} else {
+		attrElems := 1
+		for _, d := range dims {
+			attrElems *= d
+		}
+		if attrElems != inputElems && known > 0 {
+			fixed := false
+			for i := 0; i < len(dims) && !fixed; i++ {
+				prod := 1
+				for j, d := range dims {
+					if j != i {
+						prod *= d
+					}
+				}
+				if prod > 0 && inputElems%prod == 0 {
+					newVal := inputElems / prod
+					if newVal != dims[i] {
+						dims[i] = newVal
+						fixed = true
+					}
+				}
+			}
+		}
+	}
+
+	return []Shape{{Dims: dims}}, nil
+}
+
 // InferShapes walks the graph nodes and computes output tensor shapes
 // given the input shapes. Returns a map of tensor name → shape.
-func InferShapes(graph []OpNode, tensorNames []string, inputShapes map[string]Shape) (map[string]Shape, error) {
+// opt may be nil.
+func InferShapes(graph []OpNode, tensorNames []string, inputShapes map[string]Shape, opt *InferShapeOptions) (map[string]Shape, error) {
 	shapes := make(map[string]Shape, len(tensorNames))
 	// Seed with known input shapes
 	for name, s := range inputShapes {
 		shapes[name] = s
 	}
 
+	var rx reshapeExtra
+	if opt != nil {
+		rx.Hints = opt.ReshapeShapeHints
+	}
+
 	for i, node := range graph {
+		rx.TensorNames = tensorNames
+		rx.InputIndices = node.InputIndices
+
 		// Gather input shapes
 		inShapes := make([]Shape, len(node.InputIndices))
 		for j, idx := range node.InputIndices {
@@ -705,7 +895,7 @@ func InferShapes(graph []OpNode, tensorNames []string, inputShapes map[string]Sh
 		}
 
 		// Compute output shape based on operator
-		outShapes, err := inferOpOutputShapes(node.Type, inShapes, node.Attrs)
+		outShapes, err := inferOpOutputShapesEx(node.Type, inShapes, node.Attrs, &rx)
 		if err != nil {
 			return nil, fmt.Errorf("node %d (%s): %w", i, node.Type, err)
 		}
@@ -725,21 +915,20 @@ func InferShapes(graph []OpNode, tensorNames []string, inputShapes map[string]Sh
 
 // inferOpOutputShapes computes output shapes for a single operator.
 func inferOpOutputShapes(op OpType, inputs []Shape, attrs []byte) ([]Shape, error) {
+	return inferOpOutputShapesEx(op, inputs, attrs, nil)
+}
+
+func inferOpOutputShapesEx(op OpType, inputs []Shape, attrs []byte, rx *reshapeExtra) ([]Shape, error) {
 	switch op {
 	case OpMatMul, OpDense:
 		if len(inputs) < 2 {
 			return nil, errors.New("MatMul requires at least 2 inputs")
 		}
 		a, b := inputs[0], inputs[1]
-		if len(a.Dims) < 2 || len(b.Dims) < 2 {
-			return nil, errors.New("MatMul inputs must be at least 2D")
+		outDims, err := inferMatMulOutputDims(a.Dims, b.Dims)
+		if err != nil {
+			return nil, err
 		}
-		m := a.Dims[len(a.Dims)-2]
-		n := b.Dims[len(b.Dims)-1]
-		outDims := make([]int, len(a.Dims))
-		copy(outDims, a.Dims)
-		outDims[len(outDims)-2] = m
-		outDims[len(outDims)-1] = n
 		return []Shape{{Dims: outDims}}, nil
 
 	case OpAdd:
@@ -827,76 +1016,11 @@ func inferOpOutputShapes(op OpType, inputs []Shape, attrs []byte) ([]Shape, erro
 		if len(inputs) < 1 {
 			return nil, errors.New("Reshape requires 1 input")
 		}
-		// Target shape in attrs: [ndims u16, dim0 i32, dim1 i32, ...]
-		if len(attrs) < 2 {
-			return nil, errors.New("Reshape requires attrs with target shape")
+		var hint []int
+		if rx != nil {
+			hint = rx.reshapeHint()
 		}
-		ndims := int(binary.LittleEndian.Uint16(attrs[0:2]))
-		if len(attrs) < 2+ndims*4 {
-			return nil, errors.New("Reshape attrs truncated")
-		}
-		dims := make([]int, ndims)
-		for i := range dims {
-			dims[i] = int(int32(binary.LittleEndian.Uint32(attrs[2+i*4:])))
-		}
-
-		// Support -1 dimension (infer from input element count, like ONNX).
-		// Also handle dynamic reshaping: if element counts don't match and
-		// there's no explicit -1, find the dimension that changed (e.g.
-		// seq_len) and adjust it proportionally. This enables ReshapeInputs
-		// to resize tensors without patching every Reshape node's attrs.
-		inputElems := inputs[0].NumElements()
-		neg1Idx := -1
-		known := 1
-		for i, d := range dims {
-			if d == -1 {
-				neg1Idx = i
-			} else if d == 0 {
-				// 0 means "copy from input" (ONNX convention)
-				if i < len(inputs[0].Dims) {
-					dims[i] = inputs[0].Dims[i]
-				}
-				known *= dims[i]
-			} else {
-				known *= d
-			}
-		}
-		if neg1Idx >= 0 && known > 0 {
-			dims[neg1Idx] = inputElems / known
-		} else {
-			// No explicit -1. Check if element counts match.
-			attrElems := 1
-			for _, d := range dims {
-				attrElems *= d
-			}
-			if attrElems != inputElems && known > 0 {
-				// Attrs were baked for a different size (e.g. max seq_len).
-				// Find the dimension that, when adjusted, makes total equal
-				// inputElems. For each candidate dim, compute the product of
-				// ALL other dims; if inputElems is evenly divisible by that
-				// product, that dim gets adjusted.
-				// Example: [1,512,12,32] with input [1,8,384] (3072 elems):
-				//   i=1: other prod = 1*12*32=384, 3072/384=8 ✓ → [1,8,12,32]
-				fixed := false
-				for i := 0; i < len(dims) && !fixed; i++ {
-					prod := 1
-					for j, d := range dims {
-						if j != i {
-							prod *= d
-						}
-					}
-					if prod > 0 && inputElems%prod == 0 {
-						newVal := inputElems / prod
-						if newVal != dims[i] {
-							dims[i] = newVal
-							fixed = true
-						}
-					}
-				}
-			}
-		}
-
-		return []Shape{{Dims: dims}}, nil
+		return inferReshapeOutput(inputs[0], attrs, hint)
 
 	case OpConcat:
 		if len(inputs) < 2 {
@@ -975,18 +1099,25 @@ func inferOpOutputShapes(op OpType, inputs []Shape, attrs []byte) ([]Shape, erro
 		if len(inputs) < 1 {
 			return nil, errors.New("Transpose requires 1 input")
 		}
-		// Permutation from attrs: [ndims u16, perm0 u16, ...]
 		inDims := inputs[0].Dims
 		ndims := len(inDims)
 		outDims := make([]int, ndims)
-		if len(attrs) >= 2+ndims*2 {
-			// Read perm from attrs
-			for i := 0; i < ndims; i++ {
-				p := int(binary.LittleEndian.Uint16(attrs[2+i*2:]))
-				outDims[i] = inDims[p]
+		useAttrs := false
+		if len(attrs) >= 2 {
+			declared := int(binary.LittleEndian.Uint16(attrs[0:2]))
+			if declared == ndims && len(attrs) >= 2+ndims*2 {
+				useAttrs = true
+				for i := 0; i < ndims; i++ {
+					p := int(binary.LittleEndian.Uint16(attrs[2+i*2:]))
+					if p < 0 || p >= ndims {
+						useAttrs = false
+						break
+					}
+					outDims[i] = inDims[p]
+				}
 			}
-		} else {
-			// Default: reverse dims
+		}
+		if !useAttrs {
 			for i := 0; i < ndims; i++ {
 				outDims[i] = inDims[ndims-1-i]
 			}
