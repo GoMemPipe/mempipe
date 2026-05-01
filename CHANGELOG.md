@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.6.0](https://github.com/GoMemPipe/mempipe/compare/v1.5.0...v1.6.0) (2026-05-01)
+
+
+### Features
+
+* enhance shape inference and add softmax axis encoding ([be35985](https://github.com/GoMemPipe/mempipe/commit/be359854543f4f9ff36a1f3bee9e03b550a469b7))
+* enhance shape inference and add softmax axis encoding ([bb6587c](https://github.com/GoMemPipe/mempipe/commit/bb6587c949a987fb0849354edd611ac1eed4a408))
+
 ## [1.5.0](https://github.com/GoMemPipe/mempipe/compare/v1.4.0...v1.5.0) (2026-03-29)
 
 
