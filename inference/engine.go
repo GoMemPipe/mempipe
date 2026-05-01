@@ -103,7 +103,7 @@ func (e *Engine) compile(cfg engineConfig) error {
 		}
 	}
 
-	allShapes, err := InferShapes(model.Graph, model.TensorNames, inputShapes)
+	allShapes, err := InferShapes(model.Graph, model.TensorNames, inputShapes, nil)
 	if err != nil {
 		return fmt.Errorf("shape inference: %w", err)
 	}
@@ -508,7 +508,7 @@ func (e *Engine) ReshapeInputs(inputShapes map[string]Shape) error {
 	}
 
 	// 4. Re-infer all intermediate shapes.
-	allShapes, err := InferShapes(model.Graph, model.TensorNames, seedShapes)
+	allShapes, err := InferShapes(model.Graph, model.TensorNames, seedShapes, nil)
 	if err != nil {
 		return fmt.Errorf("reshape: shape inference: %w", err)
 	}

@@ -249,6 +249,16 @@ def _encode_conv_attrs(node) -> bytes:
     )
 
 
+def _encode_softmax_attrs(node) -> bytes:
+    """Encode Softmax axis as int16 LE (ONNX axis attribute; default -1 = last axis)."""
+    axis = -1
+    for attr in node.attribute:
+        if attr.name == "axis":
+            axis = int(attr.i)
+            break
+    return struct.pack("<h", axis)
+
+
 def _encode_hardsigmoid_attrs(node) -> bytes:
     """Encode HardSigmoid attrs: [alpha f32, beta f32]."""
     alpha = 0.2  # ONNX default
@@ -615,6 +625,8 @@ def from_onnx_transformer(
             )
         elif node.op_type == "Conv":
             attrs = _encode_conv_attrs(node)
+        elif node.op_type == "Softmax":
+            attrs = _encode_softmax_attrs(node)
         elif node.op_type == "HardSigmoid":
             attrs = _encode_hardsigmoid_attrs(node)
 

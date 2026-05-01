@@ -602,7 +602,7 @@ func TestShapeInference(t *testing.T) {
 		"input": {Dims: []int{1, 784}},
 		"w1":    {Dims: []int{784, 128}},
 	}
-	shapes, err := InferShapes(graph, tensorNames, inputShapes)
+	shapes, err := InferShapes(graph, tensorNames, inputShapes, nil)
 	if err != nil {
 		t.Fatalf("infer: %v", err)
 	}
