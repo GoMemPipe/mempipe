@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"slices"
 	"unsafe"
 )
 
@@ -810,12 +811,31 @@ func (conv2dOp) OutputShape(in []Shape) ([]Shape, error) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// MaxPool2D: 2×2 kernel, stride 2
+// MaxPool2D / AvgPool2D
+//
+// Attrs (optional): [kernelH u16, kernelW u16, strideH u16, strideW u16,
+//
+//	padTop u16, padLeft u16, padBottom u16, padRight u16] — same layout as shape inference in tensor.go.
+//
+// Absent or short attrs (< 4 bytes): legacy 2×2 kernel, stride 2, zero pads.
+// Strides default to 1 when only kernel is present (len 4..7). Pads default to 0 when len < 16.
 // ════════════════════════════════════════════════════════════════════════════
 
-type maxPool2dOp struct{}
+type maxPool2dOp struct {
+	attrs []byte
+}
 
-func (maxPool2dOp) Execute(inputs, outputs []*Tensor) error {
+func (op *maxPool2dOp) SetAttrs(attrs []byte) error {
+	op.attrs = slices.Clone(attrs)
+	_, _, _, _, _, _, _, _, err := parsePool2DAttrs(op.attrs)
+	return err
+}
+
+func (op *maxPool2dOp) Execute(inputs, outputs []*Tensor) error {
+	kh, kw, sh, sw, pt, pl, pb, pr, err := parsePool2DAttrs(op.attrs)
+	if err != nil {
+		return err
+	}
 	in := inputs[0]
 	out := outputs[0]
 	inData := in.EnsureFloat32()
@@ -825,18 +845,26 @@ func (maxPool2dOp) Execute(inputs, outputs []*Tensor) error {
 	c := in.shape[1]
 	h := in.shape[2]
 	w := in.shape[3]
-	oH := h / 2
-	oW := w / 2
+	oH, oW, err := pool2DOutputSpatial(h, w, kh, kw, sh, sw, pt, pl, pb, pr)
+	if err != nil {
+		return err
+	}
+	if len(out.shape) != 4 || out.shape[0] != n || out.shape[1] != c || out.shape[2] != oH || out.shape[3] != oW {
+		return fmt.Errorf("maxpool2d: output shape mismatch: got %v want [%d,%d,%d,%d]", out.shape, n, c, oH, oW)
+	}
 
 	for batch := 0; batch < n; batch++ {
 		for ch := 0; ch < c; ch++ {
 			for oh := 0; oh < oH; oh++ {
 				for ow := 0; ow < oW; ow++ {
 					maxVal := float32(-math.MaxFloat32)
-					for kh := 0; kh < 2; kh++ {
-						for kw := 0; kw < 2; kw++ {
-							ih := oh*2 + kh
-							iw := ow*2 + kw
+					for di := 0; di < kh; di++ {
+						for dj := 0; dj < kw; dj++ {
+							ih := oh*sh - pt + di
+							iw := ow*sw - pl + dj
+							if ih < 0 || ih >= h || iw < 0 || iw >= w {
+								continue
+							}
 							idx := batch*c*h*w + ch*h*w + ih*w + iw
 							if inData[idx] > maxVal {
 								maxVal = inData[idx]
@@ -852,17 +880,25 @@ func (maxPool2dOp) Execute(inputs, outputs []*Tensor) error {
 	return nil
 }
 
-func (maxPool2dOp) OutputShape(in []Shape) ([]Shape, error) {
-	return inferOpOutputShapes(OpMaxPool2D, in, nil)
+func (op *maxPool2dOp) OutputShape(in []Shape) ([]Shape, error) {
+	return inferOpOutputShapes(OpMaxPool2D, in, op.attrs)
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-// AvgPool2D: 2×2 kernel, stride 2
-// ════════════════════════════════════════════════════════════════════════════
+type avgPool2dOp struct {
+	attrs []byte
+}
 
-type avgPool2dOp struct{}
+func (op *avgPool2dOp) SetAttrs(attrs []byte) error {
+	op.attrs = slices.Clone(attrs)
+	_, _, _, _, _, _, _, _, err := parsePool2DAttrs(op.attrs)
+	return err
+}
 
-func (avgPool2dOp) Execute(inputs, outputs []*Tensor) error {
+func (op *avgPool2dOp) Execute(inputs, outputs []*Tensor) error {
+	kh, kw, sh, sw, pt, pl, pb, pr, err := parsePool2DAttrs(op.attrs)
+	if err != nil {
+		return err
+	}
 	in := inputs[0]
 	out := outputs[0]
 	inData := in.EnsureFloat32()
@@ -872,22 +908,36 @@ func (avgPool2dOp) Execute(inputs, outputs []*Tensor) error {
 	c := in.shape[1]
 	h := in.shape[2]
 	w := in.shape[3]
-	oH := h / 2
-	oW := w / 2
+	oH, oW, err := pool2DOutputSpatial(h, w, kh, kw, sh, sw, pt, pl, pb, pr)
+	if err != nil {
+		return err
+	}
+	if len(out.shape) != 4 || out.shape[0] != n || out.shape[1] != c || out.shape[2] != oH || out.shape[3] != oW {
+		return fmt.Errorf("avgpool2d: output shape mismatch: got %v want [%d,%d,%d,%d]", out.shape, n, c, oH, oW)
+	}
 
 	for batch := 0; batch < n; batch++ {
 		for ch := 0; ch < c; ch++ {
 			for oh := 0; oh < oH; oh++ {
 				for ow := 0; ow < oW; ow++ {
 					var sum float32
-					for kh := 0; kh < 2; kh++ {
-						for kw := 0; kw < 2; kw++ {
-							ih := oh*2 + kh
-							iw := ow*2 + kw
+					var cnt int
+					for di := 0; di < kh; di++ {
+						for dj := 0; dj < kw; dj++ {
+							ih := oh*sh - pt + di
+							iw := ow*sw - pl + dj
+							if ih < 0 || ih >= h || iw < 0 || iw >= w {
+								continue
+							}
 							sum += inData[batch*c*h*w+ch*h*w+ih*w+iw]
+							cnt++
 						}
 					}
-					outData[batch*c*oH*oW+ch*oH*oW+oh*oW+ow] = sum / 4.0
+					if cnt == 0 {
+						return fmt.Errorf("avgpool2d: no valid samples at out (%d,%d)", oh, ow)
+					}
+					// Exclude padding from divisor (ONNX count_include_pad default false).
+					outData[batch*c*oH*oW+ch*oH*oW+oh*oW+ow] = sum / float32(cnt)
 				}
 			}
 		}
@@ -895,8 +945,8 @@ func (avgPool2dOp) Execute(inputs, outputs []*Tensor) error {
 	return nil
 }
 
-func (avgPool2dOp) OutputShape(in []Shape) ([]Shape, error) {
-	return inferOpOutputShapes(OpAvgPool2D, in, nil)
+func (op *avgPool2dOp) OutputShape(in []Shape) ([]Shape, error) {
+	return inferOpOutputShapes(OpAvgPool2D, in, op.attrs)
 }
 
 // ════════════════════════════════════════════════════════════════════════════

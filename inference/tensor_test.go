@@ -61,6 +61,41 @@ func TestInferTransposeRankMismatchNoPanic(t *testing.T) {
 	}
 }
 
+func TestInferAvgPool2DKernel1x16DefaultStride(t *testing.T) {
+	// ONNX AveragePool: strides default to 1, pads default to 0 when omitted from attrs blob.
+	// Input [1,3,1,16], kernel [1,16] → output [1,3,1,1] (not a degenerate 0 spatial dim).
+	in := Shape{Dims: []int{1, 3, 1, 16}}
+	attrs := make([]byte, 4)
+	binary.LittleEndian.PutUint16(attrs[0:2], 1)
+	binary.LittleEndian.PutUint16(attrs[2:4], 16)
+
+	out, err := inferOpOutputShapes(OpAvgPool2D, []Shape{in}, attrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{1, 3, 1, 1}
+	if len(out) != 1 || len(out[0].Dims) != 4 {
+		t.Fatalf("got %#v", out)
+	}
+	for i := range want {
+		if out[0].Dims[i] != want[i] {
+			t.Fatalf("dim %d: got %d want %d", i, out[0].Dims[i], want[i])
+		}
+	}
+}
+
+func TestInferPool2DLegacyNoAttrs(t *testing.T) {
+	// Short attrs: legacy 2×2 kernel, stride 2 (matches old .mpmodel without attrs).
+	in := Shape{Dims: []int{1, 1, 4, 4}}
+	out, err := inferOpOutputShapes(OpAvgPool2D, []Shape{in}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || len(out[0].Dims) != 4 || out[0].Dims[2] != 2 || out[0].Dims[3] != 2 {
+		t.Fatalf("got %v", out[0].Dims)
+	}
+}
+
 func TestInferMatMul3DBroadcast(t *testing.T) {
 	a := Shape{Dims: []int{2, 8, 128}}
 	b := Shape{Dims: []int{128, 64}}
