@@ -1303,7 +1303,10 @@ func (gatherOp) OutputShape(in []Shape) ([]Shape, error) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// BatchedMatMul: C[b] = A[b] × B[b]    (float32, 3D)
+// BatchedMatMul: C[b] = A[b] × B[b]    (float32)
+//
+// When B is 2D [K,N] (one weight matrix), NumPy-style broadcasting applies: the
+// same B is used for every batch slice of A (e.g. A [B,M,K] × B → [B,M,N]).
 // ════════════════════════════════════════════════════════════════════════════
 
 type batchedMatMulOp struct{}
@@ -1315,26 +1318,35 @@ func (batchedMatMulOp) Execute(inputs, outputs []*Tensor) error {
 	cData := c.Float32s()
 
 	rank := len(a.shape)
-	m := a.shape[rank-2]
 	k := a.shape[rank-1]
 	n := b.shape[len(b.shape)-1]
 
-	// Compute total batch size (product of all dims except last 2)
+	// Shared [K,N] weight: stack leading batch × row dims into one GEMM (no heap).
+	if len(b.shape) == 2 {
+		m := 1
+		for i := 0; i < rank-1; i++ {
+			m *= a.shape[i]
+		}
+		matMulF32(aData, bData, cData, m, k, n)
+		return nil
+	}
+
+	mPanel := a.shape[rank-2]
 	batch := 1
 	for i := 0; i < rank-2; i++ {
 		batch *= a.shape[i]
 	}
 
-	aStride := m * k
+	aStride := mPanel * k
 	bStride := k * n
-	cStride := m * n
+	cStride := mPanel * n
 
 	for bi := 0; bi < batch; bi++ {
 		matMulF32(
 			aData[bi*aStride:(bi+1)*aStride],
 			bData[bi*bStride:(bi+1)*bStride],
 			cData[bi*cStride:(bi+1)*cStride],
-			m, k, n,
+			mPanel, k, n,
 		)
 	}
 	return nil
