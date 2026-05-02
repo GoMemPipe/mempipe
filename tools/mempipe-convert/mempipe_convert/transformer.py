@@ -271,6 +271,34 @@ def _encode_hardsigmoid_attrs(node) -> bytes:
     return struct.pack("<ff", alpha, beta)
 
 
+def _encode_pool2d_attrs(node) -> bytes:
+    """Encode MaxPool / AveragePool for MemPipe (matches Go parsePool2DAttrs)."""
+    kh, kw = 1, 1
+    sh, sw = 1, 1
+    pt, pl, pb, pr = 0, 0, 0, 0
+    for attr in node.attribute:
+        if attr.name == "kernel_shape":
+            ks = list(attr.ints)
+            if len(ks) >= 2:
+                kh, kw = int(ks[0]), int(ks[1])
+            elif len(ks) == 1:
+                kh = kw = int(ks[0])
+        elif attr.name == "strides":
+            st = list(attr.ints)
+            if len(st) >= 2:
+                sh, sw = int(st[0]), int(st[1])
+            elif len(st) == 1:
+                sh = sw = int(st[0])
+        elif attr.name == "pads":
+            p = list(attr.ints)
+            if len(p) >= 4:
+                pt, pl, pb, pr = int(p[0]), int(p[1]), int(p[2]), int(p[3])
+            elif len(p) == 2:
+                pt, pl = int(p[0]), int(p[1])
+                pb, pr = pt, pl
+    return struct.pack("<HHHHHHHH", kh, kw, sh, sw, pt, pl, pb, pr)
+
+
 # ── MatMul 2D vs 3D dispatch ────────────────────────────────────────────────
 
 
@@ -629,6 +657,8 @@ def from_onnx_transformer(
             attrs = _encode_softmax_attrs(node)
         elif node.op_type == "HardSigmoid":
             attrs = _encode_hardsigmoid_attrs(node)
+        elif node.op_type in ("MaxPool", "AveragePool"):
+            attrs = _encode_pool2d_attrs(node)
 
         op_nodes.append(OpNode(mp_op, input_indices, output_indices, attrs))
         i += 1

@@ -51,6 +51,40 @@ _ONNX_OP_MAP: Dict[str, OpType] = {
 }
 
 
+def _encode_pool2d_attrs(node) -> bytes:
+    """Encode MaxPool / AveragePool for MemPipe inference (matches Go parsePool2DAttrs).
+
+    Layout (little-endian u16): kernelH, kernelW, strideH, strideW,
+    padTop, padLeft, padBottom, padRight.
+
+    ONNX defaults: strides 1 per spatial dim when absent; pads 0 when absent.
+    """
+    kh, kw = 1, 1
+    sh, sw = 1, 1
+    pt, pl, pb, pr = 0, 0, 0, 0
+    for attr in node.attribute:
+        if attr.name == "kernel_shape":
+            ks = list(attr.ints)
+            if len(ks) >= 2:
+                kh, kw = int(ks[0]), int(ks[1])
+            elif len(ks) == 1:
+                kh = kw = int(ks[0])
+        elif attr.name == "strides":
+            st = list(attr.ints)
+            if len(st) >= 2:
+                sh, sw = int(st[0]), int(st[1])
+            elif len(st) == 1:
+                sh = sw = int(st[0])
+        elif attr.name == "pads":
+            p = list(attr.ints)
+            if len(p) >= 4:
+                pt, pl, pb, pr = int(p[0]), int(p[1]), int(p[2]), int(p[3])
+            elif len(p) == 2:
+                pt, pl = int(p[0]), int(p[1])
+                pb, pr = pt, pl
+    return struct.pack("<HHHHHHHH", kh, kw, sh, sw, pt, pl, pb, pr)
+
+
 def from_onnx(
     onnx_path: str,
     output_path: str,
@@ -147,7 +181,11 @@ def from_onnx(
             idx = _ensure_tensor(out_name)
             output_indices.append(idx)
 
-        op_nodes.append(OpNode(mp_op, input_indices, output_indices))
+        attrs = b""
+        if node.op_type in ("MaxPool", "AveragePool"):
+            attrs = _encode_pool2d_attrs(node)
+
+        op_nodes.append(OpNode(mp_op, input_indices, output_indices, attrs))
 
     if skipped:
         import warnings

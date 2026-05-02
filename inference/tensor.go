@@ -913,6 +913,56 @@ func InferShapes(graph []OpNode, tensorNames []string, inputShapes map[string]Sh
 	return shapes, nil
 }
 
+// parsePool2DAttrs decodes MaxPool2D/AvgPool2D operator attributes (little-endian u16 each):
+//
+//	[kernelH, kernelW, strideH, strideW, padTop, padLeft, padBottom, padRight] — 16 bytes when fully specified.
+//
+// When len(attrs) < 4 (including nil/empty), returns legacy MemPipe defaults: 2×2 kernel, stride 2, zero pads
+// (matches historical .mpmodel nodes with no attrs blob).
+// When len(attrs) >= 4, kernel is read from attrs[0:4]. Strides default to 1 if len(attrs) < 8 (ONNX).
+// Pads default to 0 if len(attrs) < 16.
+func parsePool2DAttrs(attrs []byte) (kernelH, kernelW, strideH, strideW, padTop, padLeft, padBottom, padRight int, err error) {
+	if len(attrs) < 4 {
+		return 2, 2, 2, 2, 0, 0, 0, 0, nil
+	}
+	kernelH = int(binary.LittleEndian.Uint16(attrs[0:2]))
+	kernelW = int(binary.LittleEndian.Uint16(attrs[2:4]))
+	if kernelH < 1 || kernelW < 1 {
+		return 0, 0, 0, 0, 0, 0, 0, 0, errors.New("pool2d: kernel dimensions must be >= 1")
+	}
+	if len(attrs) >= 8 {
+		strideH = int(binary.LittleEndian.Uint16(attrs[4:6]))
+		strideW = int(binary.LittleEndian.Uint16(attrs[6:8]))
+	} else {
+		strideH, strideW = 1, 1
+	}
+	if strideH < 1 || strideW < 1 {
+		return 0, 0, 0, 0, 0, 0, 0, 0, errors.New("pool2d: strides must be >= 1")
+	}
+	if len(attrs) >= 16 {
+		padTop = int(binary.LittleEndian.Uint16(attrs[8:10]))
+		padLeft = int(binary.LittleEndian.Uint16(attrs[10:12]))
+		padBottom = int(binary.LittleEndian.Uint16(attrs[12:14]))
+		padRight = int(binary.LittleEndian.Uint16(attrs[14:16]))
+	}
+	return kernelH, kernelW, strideH, strideW, padTop, padLeft, padBottom, padRight, nil
+}
+
+// pool2DOutputSpatial returns output H/W for NCHW pooling (dilation 1).
+// ONNX: floor((input + pad_start + pad_end - kernel) / stride) + 1 for each spatial axis.
+func pool2DOutputSpatial(inH, inW, kh, kw, sh, sw, padTop, padLeft, padBottom, padRight int) (outH, outW int, err error) {
+	if sh <= 0 || sw <= 0 {
+		return 0, 0, errors.New("pool2d: stride must be positive")
+	}
+	outH = (inH+padTop+padBottom-kh)/sh + 1
+	outW = (inW+padLeft+padRight-kw)/sw + 1
+	if outH < 1 || outW < 1 {
+		return 0, 0, fmt.Errorf("pool2d: degenerate output (%d×%d) for input %d×%d kernel %d×%d stride %d×%d pads [%d,%d,%d,%d]",
+			outH, outW, inH, inW, kh, kw, sh, sw, padTop, padLeft, padBottom, padRight)
+	}
+	return outH, outW, nil
+}
+
 // inferOpOutputShapes computes output shapes for a single operator.
 func inferOpOutputShapes(op OpType, inputs []Shape, attrs []byte) ([]Shape, error) {
 	return inferOpOutputShapesEx(op, inputs, attrs, nil)
@@ -988,12 +1038,19 @@ func inferOpOutputShapesEx(op OpType, inputs []Shape, attrs []byte, rx *reshapeE
 		if len(inputs) < 1 {
 			return nil, errors.New("Pool requires 1 input")
 		}
-		// Default 2×2 pool with stride 2
 		in := inputs[0]
 		if len(in.Dims) != 4 {
 			return nil, errors.New("Pool expects 4D input")
 		}
-		return []Shape{{Dims: []int{in.Dims[0], in.Dims[1], in.Dims[2] / 2, in.Dims[3] / 2}}}, nil
+		kh, kw, sh, sw, pt, pl, pb, pr, err := parsePool2DAttrs(attrs)
+		if err != nil {
+			return nil, err
+		}
+		outH, outW, err := pool2DOutputSpatial(in.Dims[2], in.Dims[3], kh, kw, sh, sw, pt, pl, pb, pr)
+		if err != nil {
+			return nil, err
+		}
+		return []Shape{{Dims: []int{in.Dims[0], in.Dims[1], outH, outW}}}, nil
 
 	case OpBatchNorm:
 		if len(inputs) < 1 {
