@@ -2,6 +2,7 @@ package inference
 
 import (
 	"encoding/binary"
+	"math"
 	"testing"
 )
 
@@ -40,6 +41,113 @@ func TestInferReshapeFromShapeInputHints(t *testing.T) {
 	}
 	if len(out[0].Dims) != 3 || out[0].Dims[0] != 2 || out[0].Dims[1] != 64 || out[0].Dims[2] != 16 {
 		t.Fatalf("got %v", out[0].Dims)
+	}
+}
+
+// Stale attrs must not override ReshapeShapeHints; hints must not be "fixed"
+// by the single-dimension attrs reconciliation path.
+func TestReshapeHintOverridesStaleAttrs(t *testing.T) {
+	inShape := Shape{Dims: []int{2, 8, 128}}
+	attrs := make([]byte, 2+3*4)
+	binary.LittleEndian.PutUint16(attrs[0:2], 3)
+	binary.LittleEndian.PutUint32(attrs[2:6], uint32(2))
+	binary.LittleEndian.PutUint32(attrs[6:10], uint32(4))  // wrong vs hint
+	binary.LittleEndian.PutUint32(attrs[10:14], uint32(256)) // product still 2048 — rewriter could corrupt
+	rx := &reshapeExtra{
+		TensorNames:  []string{"x", "shape_const", "y"},
+		InputIndices: []int{0, 1},
+		Hints:        map[string][]int{"shape_const": {2, 64, 16}},
+	}
+	out, err := inferOpOutputShapesEx(OpReshape, []Shape{inShape}, attrs, rx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{2, 64, 16}
+	if len(out[0].Dims) != 3 {
+		t.Fatalf("got %v", out[0].Dims)
+	}
+	for i := range want {
+		if out[0].Dims[i] != want[i] {
+			t.Fatalf("dim %d: got %d want %d (attrs must not override hint)", i, out[0].Dims[i], want[i])
+		}
+	}
+}
+
+func TestInferShapesWithReshapeShapeHintsOption(t *testing.T) {
+	tensorNames := []string{"in0", "shape_in", "out0"}
+	graph := []OpNode{
+		{Type: OpReshape, InputIndices: []int{0, 1}, OutputIndices: []int{2}, Attrs: nil},
+	}
+	inputShapes := map[string]Shape{
+		"in0":   {Dims: []int{2, 8, 128}},
+		"shape_in": {Dims: []int{3}}, // unused for dims — hint supplies target shape
+	}
+	opt := &InferShapeOptions{
+		ReshapeShapeHints: map[string][]int{"shape_in": {2, 64, 16}},
+	}
+	shapes, err := InferShapes(graph, tensorNames, inputShapes, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := shapes["out0"].Dims
+	want := []int{2, 64, 16}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dim %d: got %d want %d", i, got[i], want[i])
+		}
+	}
+}
+
+func TestInferBatchedMatMulBroadcast2DWeight(t *testing.T) {
+	a := Shape{Dims: []int{2, 3, 4}}
+	b := Shape{Dims: []int{4, 5}}
+	out, err := inferOpOutputShapes(OpBatchedMatMul, []Shape{a, b}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{2, 3, 5}
+	if len(out[0].Dims) != len(want) {
+		t.Fatalf("got %v", out[0].Dims)
+	}
+	for i := range want {
+		if out[0].Dims[i] != want[i] {
+			t.Fatalf("dim %d: got %d want %d", i, out[0].Dims[i], want[i])
+		}
+	}
+}
+
+func TestBatchedMatMulExecute2DBroadcastNoPanic(t *testing.T) {
+	arena := NewInferenceArena(64 * 1024)
+	a, err := arena.AllocTensor("A", []int{2, 3, 4}, Float32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := arena.AllocTensor("B", []int{4, 5}, Float32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := arena.AllocTensor("C", []int{2, 3, 5}, Float32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad := a.Float32s()
+	for i := range ad {
+		ad[i] = float32(i%7) * 0.1
+	}
+	bd := b.Float32s()
+	for i := range bd {
+		bd[i] = float32(i%3) * 0.25
+	}
+	op := batchedMatMulOp{}
+	if err := op.Execute([]*Tensor{a, b}, []*Tensor{c}); err != nil {
+		t.Fatal(err)
+	}
+	cd := c.Float32s()
+	if math.IsNaN(float64(cd[0])) || math.IsNaN(float64(cd[len(cd)-1])) {
+		t.Fatal("unexpected NaN in output")
 	}
 }
 

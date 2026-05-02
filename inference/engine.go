@@ -21,26 +21,34 @@ type compiledOp struct {
 // in a single InferenceArena, and executes the graph with zero allocations
 // on the hot path.
 type Engine struct {
-	model       *Model
-	arena       *InferenceArena
-	tensors     map[string]*Tensor // all named tensors
-	opOrder     []compiledOp       // topologically sorted op list
-	inputs      []*Tensor          // model input tensors (ordered)
-	outputs     []*Tensor          // model output tensors (ordered)
-	weightNames map[string]bool    // pre-computed set of weight tensor names
-	overrides   *EngineOverrides   // per-engine operator overrides (nil = use global)
+	model           *Model
+	arena           *InferenceArena
+	tensors         map[string]*Tensor // all named tensors
+	opOrder         []compiledOp       // topologically sorted op list
+	inputs          []*Tensor          // model input tensors (ordered)
+	outputs         []*Tensor          // model output tensors (ordered)
+	weightNames     map[string]bool    // pre-computed set of weight tensor names
+	overrides       *EngineOverrides   // per-engine operator overrides (nil = use global)
+	inferShapeOpts  *InferShapeOptions // optional reshape hints etc. (nil = defaults)
 }
 
 // EngineOption configures Engine construction.
 type EngineOption func(*engineConfig)
 
 type engineConfig struct {
-	extraArenaBytes int // extra bytes to reserve in arena
+	extraArenaBytes  int
+	inferShapeOpts   *InferShapeOptions
 }
 
 // WithExtraArena adds extra bytes to the inference arena.
 func WithExtraArena(bytes int) EngineOption {
 	return func(c *engineConfig) { c.extraArenaBytes = bytes }
+}
+
+// WithInferShapeOptions passes options into graph shape inference (e.g. Reshape
+// shape hints from the converter). Used during compile and ReshapeInputs.
+func WithInferShapeOptions(opt *InferShapeOptions) EngineOption {
+	return func(c *engineConfig) { c.inferShapeOpts = opt }
 }
 
 // NewEngine creates an inference engine from a model.
@@ -70,9 +78,10 @@ func newEngine(model *Model, overrides *EngineOverrides, opts ...EngineOption) (
 	}
 
 	e := &Engine{
-		model:     model,
-		tensors:   make(map[string]*Tensor, len(model.TensorNames)),
-		overrides: overrides,
+		model:          model,
+		tensors:        make(map[string]*Tensor, len(model.TensorNames)),
+		overrides:      overrides,
+		inferShapeOpts: cfg.inferShapeOpts,
 	}
 
 	if err := e.compile(cfg); err != nil {
@@ -103,7 +112,7 @@ func (e *Engine) compile(cfg engineConfig) error {
 		}
 	}
 
-	allShapes, err := InferShapes(model.Graph, model.TensorNames, inputShapes, nil)
+	allShapes, err := InferShapes(model.Graph, model.TensorNames, inputShapes, cfg.inferShapeOpts)
 	if err != nil {
 		return fmt.Errorf("shape inference: %w", err)
 	}
@@ -508,7 +517,7 @@ func (e *Engine) ReshapeInputs(inputShapes map[string]Shape) error {
 	}
 
 	// 4. Re-infer all intermediate shapes.
-	allShapes, err := InferShapes(model.Graph, model.TensorNames, seedShapes, nil)
+	allShapes, err := InferShapes(model.Graph, model.TensorNames, seedShapes, e.inferShapeOpts)
 	if err != nil {
 		return fmt.Errorf("reshape: shape inference: %w", err)
 	}

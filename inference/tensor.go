@@ -778,35 +778,39 @@ func matMulGEMMSizes(aShape, bShape []int) (m, k, n int, err error) {
 	return m, k, n, nil
 }
 
-func parseReshapeTargetDims(attrs []byte, hint []int) ([]int, error) {
+// parseReshapeTargetDims returns target dimensions for Reshape.
+// Shape hints (e.g. from InferShapeOptions.ReshapeShapeHints) take precedence
+// over the attrs blob so converters can supply the true shape when attrs are
+// stale or incomplete.
+func parseReshapeTargetDims(attrs []byte, hint []int) (dims []int, fromHint bool, err error) {
+	if len(hint) > 0 {
+		dims = make([]int, len(hint))
+		copy(dims, hint)
+		return dims, true, nil
+	}
 	if len(attrs) >= 2 {
 		ndims := int(binary.LittleEndian.Uint16(attrs[0:2]))
 		if ndims < 0 || ndims > 64 {
-			return nil, errors.New("reshape: invalid ndims")
+			return nil, false, errors.New("reshape: invalid ndims")
 		}
 		need := 2 + ndims*4
 		if len(attrs) >= need {
-			dims := make([]int, ndims)
+			dims = make([]int, ndims)
 			for i := range dims {
 				off := 2 + i*4
 				if off+4 > len(attrs) {
-					return nil, errors.New("reshape attrs truncated")
+					return nil, false, errors.New("reshape attrs truncated")
 				}
 				dims[i] = int(int32(binary.LittleEndian.Uint32(attrs[off:])))
 			}
-			return dims, nil
+			return dims, false, nil
 		}
 	}
-	if len(hint) > 0 {
-		dims := make([]int, len(hint))
-		copy(dims, hint)
-		return dims, nil
-	}
-	return nil, errors.New("reshape: missing target shape (attrs or shape-input hints)")
+	return nil, false, errors.New("reshape: missing target shape (attrs or shape-input hints)")
 }
 
 func inferReshapeOutput(in Shape, attrs []byte, hint []int) ([]Shape, error) {
-	dims, err := parseReshapeTargetDims(attrs, hint)
+	dims, fromHint, err := parseReshapeTargetDims(attrs, hint)
 	if err != nil {
 		return nil, err
 	}
@@ -841,22 +845,38 @@ func inferReshapeOutput(in Shape, attrs []byte, hint []int) ([]Shape, error) {
 		for _, d := range dims {
 			attrElems *= d
 		}
-		if attrElems != inputElems && known > 0 {
-			fixed := false
-			for i := 0; i < len(dims) && !fixed; i++ {
-				prod := 1
-				for j, d := range dims {
-					if j != i {
-						prod *= d
+		if attrElems != inputElems {
+			if fromHint {
+				return nil, fmt.Errorf("reshape: hinted shape has %d elements, input has %d", attrElems, inputElems)
+			}
+			if known > 0 {
+				fixed := false
+				for i := 0; i < len(dims) && !fixed; i++ {
+					prod := 1
+					for j, d := range dims {
+						if j != i {
+							prod *= d
+						}
+					}
+					if prod > 0 && inputElems%prod == 0 {
+						newVal := inputElems / prod
+						if newVal != dims[i] {
+							dims[i] = newVal
+							fixed = true
+						}
 					}
 				}
-				if prod > 0 && inputElems%prod == 0 {
-					newVal := inputElems / prod
-					if newVal != dims[i] {
-						dims[i] = newVal
-						fixed = true
+				if fixed {
+					attrElems = 1
+					for _, d := range dims {
+						attrElems *= d
 					}
 				}
+				if attrElems != inputElems {
+					return nil, fmt.Errorf("reshape: cannot reconcile attrs with input element count %d", inputElems)
+				}
+			} else {
+				return nil, fmt.Errorf("reshape: element count mismatch %d vs input %d", attrElems, inputElems)
 			}
 		}
 	}
@@ -1142,14 +1162,11 @@ func inferOpOutputShapesEx(op OpType, inputs []Shape, attrs []byte, rx *reshapeE
 		if len(a.Dims) < 2 || len(b.Dims) < 2 {
 			return nil, errors.New("BatchedMatMul inputs must be at least 2D")
 		}
-		// Last 2 dims are the matrix: [..., M, K] x [..., K, N] → [..., M, N]
-		m := a.Dims[len(a.Dims)-2]
-		n := b.Dims[len(b.Dims)-1]
-		// Batch dims = all dims except last 2
-		outDims := make([]int, len(a.Dims))
-		copy(outDims, a.Dims[:len(a.Dims)-2])
-		outDims[len(outDims)-2] = m
-		outDims[len(outDims)-1] = n
+		// NumPy/ONNX-style: broadcast batch axes (e.g. A [B,M,K] × B [K,N] → [B,M,N]).
+		outDims, err := inferMatMulOutputDims(a.Dims, b.Dims)
+		if err != nil {
+			return nil, err
+		}
 		return []Shape{{Dims: outDims}}, nil
 
 	case OpTranspose:
