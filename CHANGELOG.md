@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.9.0](https://github.com/GoMemPipe/mempipe/compare/v1.8.0...v1.9.0) (2026-05-02)
+
+
+### Features
+
+* add connectivity tests for ONNX transformer-style graphs ([934e2bc](https://github.com/GoMemPipe/mempipe/commit/934e2bc6b535a4337088a0ca82659ebd0a2e40e4))
+* add connectivity tests for ONNX transformer-style graphs ([58e59d2](https://github.com/GoMemPipe/mempipe/commit/58e59d2adb6af4a22d7a21d185988e003b3244a8))
+
 ## [1.8.0](https://github.com/GoMemPipe/mempipe/compare/v1.7.0...v1.8.0) (2026-05-02)
 
 
