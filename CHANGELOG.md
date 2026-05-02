@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.8.0](https://github.com/GoMemPipe/mempipe/compare/v1.7.0...v1.8.0) (2026-05-02)
+
+
+### Features
+
+* enhance inference engine with shape inference options ([c552d72](https://github.com/GoMemPipe/mempipe/commit/c552d725a2c52c42ab26bd302f8c2d1dcbd8ce50))
+* enhance inference engine with shape inference options ([ac22cfd](https://github.com/GoMemPipe/mempipe/commit/ac22cfdfde32464e15faa776723bd0d9526e4950))
+
 ## [1.7.0](https://github.com/GoMemPipe/mempipe/compare/v1.6.0...v1.7.0) (2026-05-02)
 
 
