@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7.0](https://github.com/GoMemPipe/mempipe/compare/v1.6.0...v1.7.0) (2026-05-02)
+
+
+### Features
+
+* enhance MaxPool2D and AvgPool2D operators with attribute support ([a392e4d](https://github.com/GoMemPipe/mempipe/commit/a392e4dd0923093df0702cd8a688581520a1dd8a))
+* enhance MaxPool2D and AvgPool2D operators with attribute support ([4eb34fc](https://github.com/GoMemPipe/mempipe/commit/4eb34fca3c3998f45ddb9d4df3019f1234145ac5))
+
 ## [1.6.0](https://github.com/GoMemPipe/mempipe/compare/v1.5.0...v1.6.0) (2026-05-01)
 
 
