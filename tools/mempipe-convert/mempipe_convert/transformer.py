@@ -68,16 +68,14 @@ _TRANSFORMER_ONNX_OP_MAP: Dict[str, OpType] = {
     "HardSwish": OpType.HardSwish,
 }
 
-# Ops we treat as shape-only / no-ops (skip in the graph)
+# Ops we treat as shape-only / no-ops (skip in the graph).
+# Unsqueeze, Squeeze, Identity, Dropout are handled explicitly as Reshape so
+# activations stay connected; skipping them previously left outputs zero-filled.
 _SKIP_OPS: Set[str] = {
     "Shape",
-    "Unsqueeze",
-    "Squeeze",
     "Cast",
     "Constant",
     "ConstantOfShape",
-    "Identity",
-    "Dropout",
 }
 
 
@@ -358,6 +356,99 @@ def _encode_reshape_attrs(
     return struct.pack("<H" + "i" * ndims, ndims, *target)
 
 
+def _encode_reshape_attrs_explicit(target: List[int]) -> bytes:
+    """Encode Reshape target shape when the ONNX shape input is not an initializer."""
+    ndims = len(target)
+    return struct.pack("<H" + "i" * ndims, ndims, *target)
+
+
+def _normalize_axes(axes: List[int], rank: int) -> List[int]:
+    out: List[int] = []
+    for a in axes:
+        if a < 0:
+            a += rank
+        out.append(a)
+    return out
+
+
+def _unsqueeze_output_dims(inp_dims: List[int], axes: List[int]) -> List[int]:
+    """Insert a size-1 dimension at each axis (ONNX Unsqueeze), smallest axis first."""
+    out = list(inp_dims)
+    for a in sorted(axes):
+        r = len(out)
+        if a < 0:
+            a += r + 1
+        if a < 0 or a > r:
+            raise ValueError(f"Unsqueeze axis {a} out of range for rank {r}")
+        out.insert(int(a), 1)
+    return out
+
+
+def _squeeze_output_dims(inp_dims: List[int], axes: Optional[List[int]]) -> List[int]:
+    if axes is None:
+        return [d for d in inp_dims if d != 1]
+    drop = set(_normalize_axes(list(axes), len(inp_dims)))
+    result: List[int] = []
+    for i, d in enumerate(inp_dims):
+        if i in drop:
+            continue
+        result.append(d)
+    return result
+
+
+def _read_axes_attr(node, initializers: Dict[str, np.ndarray]) -> Optional[List[int]]:
+    """Read ONNX axes from attribute or from optional initializer input (opset 13+)."""
+    for attr in node.attribute:
+        if attr.name == "axes":
+            return list(attr.ints)
+    if len(node.input) > 1:
+        ax_name = node.input[1]
+        if ax_name in initializers:
+            raw = initializers[ax_name].flatten()
+            if raw.dtype == np.float32:
+                return [int(x) for x in raw.view(np.int32)]
+            return [int(x) for x in raw]
+    return None
+
+
+def _resolve_view_out_shape(
+    in_name: str,
+    out_name: str,
+    inferred_shapes: Dict[str, List[int]],
+    tensor_shapes: Dict[str, Shape],
+) -> Optional[List[int]]:
+    if out_name in inferred_shapes:
+        return list(inferred_shapes[out_name])
+    if in_name in inferred_shapes:
+        return list(inferred_shapes[in_name])
+    ts = tensor_shapes.get(in_name)
+    if ts:
+        return list(ts.dims)
+    return None
+
+
+def _lift_constant_initializers(graph, initializers: Dict[str, np.ndarray]) -> None:
+    """Fold ONNX Constant nodes into initializers so weights are packed and tensors get data."""
+    for node in graph.node:
+        if node.op_type != "Constant" or not node.output:
+            continue
+        out_name = node.output[0]
+        if out_name in initializers:
+            continue
+        for attr in node.attribute:
+            if attr.name != "value":
+                continue
+            arr = np.array(numpy_helper.to_array(attr.t))
+            if arr.dtype in (np.int64, np.int32, np.int16, np.int8):
+                arr = arr.astype(np.int32).view(np.float32)
+            elif arr.dtype == np.bool_:
+                arr = arr.astype(np.int32).view(np.float32)
+            else:
+                arr = arr.astype(np.float32)
+            initializers[out_name] = arr
+            break
+
+
 # ── Dynamic dim fixing + shape inference ────────────────────────────────────
 
 
@@ -493,6 +584,8 @@ def from_onnx_transformer(
             arr = arr.astype(np.float32)
         initializers[init.name] = arr
 
+    _lift_constant_initializers(graph, initializers)
+
     # ── Pre-transpose Gemm weights with transB=1 ─────────────────────────
     for node in graph.node:
         if node.op_type == "Gemm":
@@ -561,6 +654,111 @@ def from_onnx_transformer(
 
         # Skip nodes consumed by fusion
         if i < skip_until:
+            i += 1
+            continue
+
+        # ── View / passthrough ops → Reshape (runtime copies data; keeps graph connected)
+        if node.op_type in ("Identity", "Dropout"):
+            if not node.input or not node.output:
+                i += 1
+                continue
+            in_name = node.input[0]
+            out_name = node.output[0]
+            vshape = _resolve_view_out_shape(
+                in_name, out_name, inferred_shapes, tensor_shapes
+            )
+            if vshape is None:
+                warnings.warn(
+                    f"Could not resolve shape for {node.op_type} output {out_name!r}; skipping node"
+                )
+                i += 1
+                continue
+            in_idx = _ensure_tensor(in_name, inferred_shapes.get(in_name))
+            out_idx = _ensure_tensor(out_name, vshape)
+            tensor_shapes[out_name] = Shape(vshape)
+            op_nodes.append(
+                OpNode(
+                    OpType.Reshape,
+                    [in_idx],
+                    [out_idx],
+                    _encode_reshape_attrs_explicit(vshape),
+                )
+            )
+            i += 1
+            continue
+
+        if node.op_type == "Unsqueeze":
+            if not node.input or not node.output:
+                i += 1
+                continue
+            in_name = node.input[0]
+            out_name = node.output[0]
+            vshape = _resolve_view_out_shape(
+                in_name, out_name, inferred_shapes, tensor_shapes
+            )
+            if vshape is None:
+                axes = _read_axes_attr(node, initializers)
+                idims: Optional[List[int]] = None
+                if in_name in tensor_shapes:
+                    idims = list(tensor_shapes[in_name].dims)
+                elif in_name in inferred_shapes:
+                    idims = list(inferred_shapes[in_name])
+                if idims is not None and axes:
+                    try:
+                        vshape = _unsqueeze_output_dims(idims, axes)
+                    except ValueError:
+                        vshape = None
+            if vshape is None:
+                warnings.warn(f"Could not resolve Unsqueeze output shape for {out_name!r}")
+                i += 1
+                continue
+            in_idx = _ensure_tensor(in_name, inferred_shapes.get(in_name))
+            out_idx = _ensure_tensor(out_name, vshape)
+            tensor_shapes[out_name] = Shape(vshape)
+            op_nodes.append(
+                OpNode(
+                    OpType.Reshape,
+                    [in_idx],
+                    [out_idx],
+                    _encode_reshape_attrs_explicit(vshape),
+                )
+            )
+            i += 1
+            continue
+
+        if node.op_type == "Squeeze":
+            if not node.input or not node.output:
+                i += 1
+                continue
+            in_name = node.input[0]
+            out_name = node.output[0]
+            vshape = _resolve_view_out_shape(
+                in_name, out_name, inferred_shapes, tensor_shapes
+            )
+            if vshape is None:
+                axes = _read_axes_attr(node, initializers)
+                idims: Optional[List[int]] = None
+                if in_name in tensor_shapes:
+                    idims = list(tensor_shapes[in_name].dims)
+                elif in_name in inferred_shapes:
+                    idims = list(inferred_shapes[in_name])
+                if idims is not None:
+                    vshape = _squeeze_output_dims(idims, axes if axes else None)
+            if vshape is None:
+                warnings.warn(f"Could not resolve Squeeze output shape for {out_name!r}")
+                i += 1
+                continue
+            in_idx = _ensure_tensor(in_name, inferred_shapes.get(in_name))
+            out_idx = _ensure_tensor(out_name, vshape)
+            tensor_shapes[out_name] = Shape(vshape)
+            op_nodes.append(
+                OpNode(
+                    OpType.Reshape,
+                    [in_idx],
+                    [out_idx],
+                    _encode_reshape_attrs_explicit(vshape),
+                )
+            )
             i += 1
             continue
 
