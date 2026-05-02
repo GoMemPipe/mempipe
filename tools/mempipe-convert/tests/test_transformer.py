@@ -94,10 +94,11 @@ class TestTransformerConverter:
         from mempipe_convert.transformer import _SKIP_OPS
 
         assert "Shape" in _SKIP_OPS
-        assert "Unsqueeze" in _SKIP_OPS
         assert "Cast" in _SKIP_OPS
-        assert "Identity" in _SKIP_OPS
-        assert "Dropout" in _SKIP_OPS
+        assert "Constant" in _SKIP_OPS
+        # Identity / Unsqueeze / Squeeze / Dropout emit Reshape — must not be skipped.
+        assert "Unsqueeze" not in _SKIP_OPS
+        assert "Identity" not in _SKIP_OPS
 
     def test_transformer_onnx_op_map(self):
         from mempipe_convert.transformer import _TRANSFORMER_ONNX_OP_MAP
@@ -138,10 +139,11 @@ class TestSliceAttrsEncoding:
             def __init__(self, inputs):
                 self.input = inputs
 
+        # Slice indices are int64/int32 in ONNX; our converter reads int32 bits via float32 view.
         inits = {
-            "starts": np.array([0], dtype=np.float32),
-            "ends": np.array([128], dtype=np.float32),
-            "axes": np.array([1], dtype=np.float32),
+            "starts": np.array([0], dtype=np.int32).view(np.float32),
+            "ends": np.array([128], dtype=np.int32).view(np.float32),
+            "axes": np.array([1], dtype=np.int32).view(np.float32),
         }
         node = MockNode(["data", "starts", "ends", "axes"])
         result = _encode_slice_attrs(node, inits)
