@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.10.0](https://github.com/GoMemPipe/mempipe/compare/v1.9.0...v1.10.0) (2026-05-02)
+
+
+### Features
+
+* enhance ONNX transformer conversion warnings ([a3aa71f](https://github.com/GoMemPipe/mempipe/commit/a3aa71f2874ac25566403ad9d9469c1f0e7b36d8))
+* enhance ONNX transformer conversion warnings ([1e899cc](https://github.com/GoMemPipe/mempipe/commit/1e899cc5d1eee0a4cf31639fccd31486f9b5dc81))
+
 ## [1.9.0](https://github.com/GoMemPipe/mempipe/compare/v1.8.0...v1.9.0) (2026-05-02)
 
 
