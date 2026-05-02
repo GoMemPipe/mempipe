@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import struct
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -643,6 +644,7 @@ def from_onnx_transformer(
     # ── Convert nodes with fusion passes ──────────────────────────────────
     op_nodes: List[OpNode] = []
     skipped = 0
+    skipped_op_types: List[str] = []
     skip_until = -1  # index to skip to (for fused patterns)
     fused_gelu = 0
     fused_ln = 0
@@ -811,6 +813,7 @@ def from_onnx_transformer(
 
         if mp_op is None:
             skipped += 1
+            skipped_op_types.append(node.op_type)
             # Register outputs so graph stays connected
             for out_name in node.output:
                 if out_name:
@@ -862,7 +865,11 @@ def from_onnx_transformer(
         i += 1
 
     if skipped:
-        warnings.warn(f"Skipped {skipped} unsupported ONNX ops during transformer conversion")
+        c = Counter(skipped_op_types)
+        detail = ", ".join(f"{op}×{n}" for op, n in sorted(c.items()))
+        warnings.warn(
+            f"Skipped {skipped} unsupported ONNX ops during transformer conversion: {detail}"
+        )
     if fused_gelu:
         print(f"  Fused {fused_gelu} GELU pattern(s)")
     if fused_ln:
